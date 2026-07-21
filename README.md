@@ -1,0 +1,2 @@
+# EIGHTDESIGN_Analysis
+エイトデザインのドメインごと分析一覧表のGoogle Apps Script
