@@ -1,0 +1,180 @@
+// ============================================================
+// loadGas.mjs — GAS(.gs) コードを Node.js 上で評価するテストハーネス
+// ------------------------------------------------------------
+// 目的: 現行の .gs コードを一切改変せずに読み込み、純粋関数・集計関数の
+//       「現在の出力」を特性テスト（characterization test）で固定する。
+//
+// 制約遵守:
+//   - 外部 npm パッケージ不使用（node:fs / node:vm / node:path / node:url のみ）
+//   - GAS V8 と同様、全 .gs は単一グローバルスコープで評価する
+//   - GAS プラットフォーム API はテスト用スタブで代替（実 API へは接続しない）
+//   - .gs ファイルの内容は読み取るだけで書き換えない
+// ============================================================
+
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+export const REPO_ROOT = join(HERE, '..', '..');
+
+/**
+ * 系統1（Kintone Webhook → 一覧シート書き込み）に必要な .gs ファイル群。
+ * GAS 実行時と同じく単一スコープへ連結して評価する。
+ * グラフ集計（旧 graph/ 一式）は廃止（集計はスプレッドシートの数式で行う方針）。
+ */
+export const CORE_FILES = [
+  'Kintone/config.gs',       // 定数・フィールドコード・シート列定義
+  'Kintone/utils.gs',        // ロガー・入力検証
+  'Kintone/parser.gs',       // Kintone構造の抽出・パース
+  'Kintone/transformer.gs',  // 正規化・行データ生成・モデル
+  'Kintone/sheets.gs',       // シート取得・書き込み
+  'Kintone/main.gs',         // エントリ・Webhook制御・振り分け
+];
+
+/** テストから参照できるよう globalThis へ公開するシンボル名 */
+const EXPOSED = [
+  // 定数
+  'CUSTOMER_APP_ID', 'SALES_APP_ID', 'RANK_MAP', 'CUSTOMER_TYPES', 'AREAS',
+  'CUSTOMER_LIST_COLS', 'SALES_LIST_COLS', 'LIST_COL_INDEX',
+  'RESIDENTIAL_EXTRA_COLS', 'BUSINESS_EXTRA_COLS',
+  // 変換・正規化
+  'transformInquiryDate', 'normalizeCustomerType', 'normalizePromotionArea',
+  'transformRank', 'transformNegotiationStatus', 'transformIncome', 'extractEventDetail',
+  // Kintone パーサ
+  'getUserFieldName', 'getSubtableRows', 'parseLatestNegotiation',
+  'parseMeetingData', 'parseInquiryContent',
+  // 行データ生成
+  'buildCustomerRowData', 'buildSalesRowData',
+  // 正規化済みモデル
+  'buildNormalizedRecord',
+  // 検証・ディスパッチ・パース
+  'validateWebhookPayload', 'validateCustomerRecord', 'validateSalesRecord',
+  '_validateRecordByApp', '_extractFieldsByApp', 'extractCustomerFields', 'extractSalesFields',
+  'parseWebhookBody',
+  // シート名
+  'buildListSheetName',
+  // 行探索・書き込み計画
+  'planRowWrite', 'applyRowWrite', 'updateRowData',
+];
+
+/**
+ * GAS プラットフォーム API のテスト用スタブを構築する。
+ * 実 API・実データ・秘密情報へは一切アクセスしない。
+ * @param {Object<string,string>} scriptProps スクリプトプロパティの疑似値
+ */
+function buildGasStubs(scriptProps) {
+  const props = {
+    SPREADSHEET_ID: 'TEST_SPREADSHEET_ID',
+    SLACK_WEBHOOK_URL: '',   // 空 → Slack 通知はスキップされる
+    DEBUG_MODE: 'false',
+    ...scriptProps,
+  };
+
+  return {
+    PropertiesService: {
+      getScriptProperties: () => ({
+        getProperty: (k) => (k in props ? props[k] : null),
+      }),
+    },
+    Session: {
+      getScriptTimeZone: () => 'Asia/Tokyo',
+    },
+    Utilities: {
+      // ログ出力用途のみ。厳密な書式は問わないので ISO 風文字列を返す。
+      formatDate: (date, _tz, _fmt) =>
+        (date instanceof Date ? date.toISOString() : String(date)),
+    },
+    ContentService: {
+      MimeType: { JSON: 'application/json' },
+      createTextOutput: (text) => ({
+        _text: text,
+        setMimeType() { return this; },
+        getContent() { return this._text; },
+      }),
+    },
+    // 以下は本ハーネスのテストでは呼ばない想定。誤使用を検知できるよう明示的に投げる。
+    SpreadsheetApp: {
+      openById: () => { throw new Error('SpreadsheetApp.openById はテストで使用しない'); },
+    },
+    UrlFetchApp: {
+      fetch: () => { throw new Error('UrlFetchApp.fetch はテストで使用しない（実 API 禁止）'); },
+    },
+    Logger: { log: () => {} },
+  };
+}
+
+/**
+ * .gs 群を単一スコープで評価し、公開シンボルを返す。
+ *
+ * 実装メモ: node:vm の別レルムだと生成される配列/オブジェクトの prototype が
+ * ホストと異なり deepStrictEqual が誤検知するため、ホストレルム上の
+ * `new Function` ファクトリで評価する（GAS プラットフォーム API は引数で注入）。
+ *
+ * @param {{ files?: string[], scriptProps?: Object<string,string>, quiet?: boolean }} [opts]
+ * @returns {Object} 公開された関数・定数のマップ
+ */
+export function loadGas(opts = {}) {
+  const files = opts.files ?? CORE_FILES;
+  const quiet = opts.quiet ?? true;
+
+  const sources = files.map((rel) => {
+    const abs = join(REPO_ROOT, rel);
+    return `\n// ===== ${rel} =====\n` + readFileSync(abs, 'utf8');
+  });
+
+  // 末尾で公開シンボルをローカルの __out へ集約して return する。
+  // 未定義シンボルがあっても落とさないよう typeof ガードで拾う。
+  const epilogue =
+    '\n;var __out = {};\n' +
+    EXPOSED.map(
+      (name) =>
+        `try { if (typeof ${name} !== 'undefined') __out.${name} = ${name}; } catch (e) {}`,
+    ).join('\n') +
+    '\nreturn __out;';
+
+  const stubs = buildGasStubs(opts.scriptProps ?? {});
+  const consoleStub = quiet
+    ? { log() {}, info() {}, warn() {}, error() {}, debug() {} }
+    : console;
+
+  const paramNames = [
+    'PropertiesService', 'Session', 'Utilities', 'ContentService',
+    'SpreadsheetApp', 'UrlFetchApp', 'Logger', 'console',
+  ];
+  // eslint-disable-next-line no-new-func
+  const factory = new Function(...paramNames, sources.join('\n') + epilogue);
+  return factory(
+    stubs.PropertiesService, stubs.Session, stubs.Utilities, stubs.ContentService,
+    stubs.SpreadsheetApp, stubs.UrlFetchApp, stubs.Logger, consoleStub,
+  );
+}
+
+/**
+ * setValues/setValue の呼び出しを記録するフェイクの Sheet を生成する。
+ * @returns {{ sheet: Object, writes: Array, singleSets: Array, inserts: Array }}
+ */
+export function makeFakeSheet(lastColumn = 60) {
+  const writes = [];       // { row, col, numRows, numCols, values }
+  const singleSets = [];   // { row, col, value }
+  const inserts = [];      // afterRow
+  const sheet = {
+    getName: () => 'FAKE_SHEET',
+    getLastColumn: () => lastColumn,
+    insertRowAfter: (afterRow) => { inserts.push(afterRow); },
+    getRange: (row, col, numRows = 1, numCols = 1) => ({
+      setValues: (values) => { writes.push({ row, col, numRows, numCols, values }); },
+      setValue: (value) => { singleSets.push({ row, col, value }); },
+      getValues: () => Array.from({ length: numRows }, () => new Array(numCols).fill('')),
+    }),
+  };
+  return { sheet, writes, singleSets, inserts };
+}
+
+/**
+ * 指定サイズの空グラフデータ（0 始まりのダミー行を先頭に含む二次元配列）を作る。
+ * getFormattedSheetData と同様、index=行番号 になるようにしておく。
+ */
+export function makeGraphData(rows = 520, cols = 12) {
+  return Array.from({ length: rows }, () => new Array(cols).fill(''));
+}

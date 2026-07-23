@@ -1,7 +1,5 @@
 /**
- * kintoneParser.gs
- * kintone固有構造を吸収する
- * kintone依存処理をこの層に閉じ込め、将来API経由取得への変更を容易にする
+ * parser.gs — Kintone固有構造の抽出・パース（旧 kintoneParser.gs）
  */
 
 // ============================================================
@@ -9,15 +7,15 @@
 // ============================================================
 
 /**
- * WebhookペイロードからアプリIDとレコードを取得する
+ * WebhookペイロードからアプリID・レコード・イベント種別を取得する
  * @param {string} rawBody - リクエストボディ（JSON文字列）
- * @returns {{ appId: string, record: Object }}
+ * @returns {{ appId: string, record: Object, type: string }}
  * @throws {Error} パース・バリデーションエラー
  */
 function parseWebhookBody(rawBody) {
-  const { appId, record } = validateWebhookPayload(rawBody);
-  AppLogger.info('Webhookパース完了', { appId });
-  return { appId, record };
+  const { appId, record, type } = validateWebhookPayload(rawBody);
+  AppLogger.info('Webhookパース完了', { appId, type });
+  return { appId, record, type };
 }
 
 // ============================================================

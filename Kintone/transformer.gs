@@ -1,7 +1,5 @@
 /**
- * recordTransformer.gs
- * 業務ロジック変換層
- * 最も変更が発生しやすい層。Spreadsheet依存を持たず、純粋関数に近づける
+ * transformer.gs — 業務ロジック変換・正規化モデル（旧 recordTransformer.gs）
  */
 
 // ============================================================
@@ -18,26 +16,24 @@
 function transformInquiryDate(inquiryDateStr) {
   if (!inquiryDateStr) return {};
 
-  let [year, month, day] = inquiryDateStr.split('-').map(Number);
+  // 元の年・月・日（「反響日」表示や繰り上げ判定の基準に使う）
+  const [origYear, origMonth, origDay] = inquiryDateStr.split('-').map(Number);
+  let year  = origYear;
+  let month = origMonth;
 
   // 12月21日以降 → 翌年扱い
-  if (month === YEAR_ROLLOVER.month && day >= YEAR_ROLLOVER.day) year++;
+  if (origMonth === YEAR_ROLLOVER.month && origDay >= YEAR_ROLLOVER.day) year++;
 
   // 21日以降 → 翌月扱い（12月→1月）
-  if (day >= MONTH_ROLLOVER_DAY) {
+  if (origDay >= MONTH_ROLLOVER_DAY) {
     month++;
     if (month > 12) month = 1;
   }
 
-  // 元の月・日を「反響日」表示用に残す
-  const originalParts = inquiryDateStr.split('-');
-  const originalMonth = parseInt(originalParts[1], 10);
-  const originalDay   = parseInt(originalParts[2], 10);
-
   return {
     year:       `${year}年`,
     month:      `${month}月`,
-    monthAndDay:`${originalMonth}月${originalDay}日`,
+    monthAndDay:`${origMonth}月${origDay}日`,
   };
 }
 
@@ -199,7 +195,8 @@ function buildSalesRowData(fields, negotiation, meetingData) {
     { col: SALES_LIST_COLS.WORK_PLACE,           value: fields.workPlace },
     { col: SALES_LIST_COLS.INDUSTRY,             value: fields.industry },
     { col: SALES_LIST_COLS.OCCUPATION,           value: fields.occupation },
-    { col: SALES_LIST_COLS.FAMILY_MEMBER,        value: fields.familyMember },
+    // 家族数（列27）は営業レコードに存在しないため書き込まない。
+    // 顧客情報アプリの Webhook が設定した値を、営業更新のたびに空で上書きしないため。
     { col: SALES_LIST_COLS.INCOME,               value: transformIncome(fields.income) },
     { col: SALES_LIST_COLS.SELF_FUNDED,          value: fields.selfFunded },
   ];
@@ -252,10 +249,10 @@ function _buildExtraRowData(customerType, fields, eventDetail) {
  * @returns {Array<{ col: number, value: * }>}
  */
 function _buildResidentialExtraData(fields, eventDetail) {
-  const inquiryNeedsEntry = _resolveInquiryNeeds(fields.hopeRenovation, fields.landAttributes);
+  const inquiryNeedsEntries = _resolveInquiryNeeds(fields.hopeRenovation, fields.landAttributes);
   return [
     { col: SALES_LIST_COLS.CURRENT_RESIDENCE,   value: fields.currentResidence },
-    inquiryNeedsEntry,
+    ...inquiryNeedsEntries,
     { col: RESIDENTIAL_EXTRA_COLS.WORK_PLACE_SUB, value: fields.workPlaceSub },
     { col: RESIDENTIAL_EXTRA_COLS.INCOME_SUB,     value: transformIncome(fields.incomeSub) },
     { col: RESIDENTIAL_EXTRA_COLS.REASON,         value: fields.reason },
@@ -270,9 +267,9 @@ function _buildResidentialExtraData(fields, eventDetail) {
  * @param {{ col: number, value: string }} hopeTypeEntry
  * @returns {Array<{ col: number, value: * }>}
  */
-function _buildBusinessExtraData(fields, eventDetail, hopeTypeEntry) {
+function _buildBusinessExtraData(fields, eventDetail, hopeTypeEntries) {
   return [
-    hopeTypeEntry,
+    ...hopeTypeEntries,
     { col: BUSINESS_EXTRA_COLS.JOB_TITLE,      value: fields.jobTitle },
     { col: BUSINESS_EXTRA_COLS.HOPE_BUSINESS,  value: fields.hopeBusinessType },
     { col: BUSINESS_EXTRA_COLS.CAPITAL_STOCK,  value: fields.capitalStock },
@@ -286,49 +283,136 @@ function _buildBusinessExtraData(fields, eventDetail, hopeTypeEntry) {
 // ============================================================
 
 /**
- * 希望リノベ種別・物件有無から「問い合わせニーズ」列を決定する
+ * 3つの分類フラグ列について、該当列に '1'、それ以外は '' を書く列エントリ群を生成する。
+ * 非該当となった列も毎回 '' で明示的にクリアするため、分類変更時に旧フラグが残らない。
+ * @param {number[]} allCols - 対象となる全フラグ列（1始まり）
+ * @param {number|undefined} activeCol - '1' を立てる列（該当なしは undefined）
+ * @returns {Array<{ col: number, value: string }>}
+ */
+function _buildFlagEntries(allCols, activeCol) {
+  return allCols.map(col => ({ col, value: col === activeCol ? '1' : '' }));
+}
+
+/**
+ * 希望リノベ種別・物件有無から「問い合わせニーズ」フラグ列（一次取得/持家/実家）を決定する。
+ * 該当列に '1'、他の2列は '' でクリアする。
  * @param {string} renovationType
  * @param {string} landAvailability
- * @returns {{ col: number, value: string }}
+ * @returns {Array<{ col: number, value: string }>}
  */
 function _resolveInquiryNeeds(renovationType, landAvailability) {
+  const R = RESIDENTIAL_EXTRA_COLS;
+  let activeCol;
   if (renovationType === 'マンションリノベ' || renovationType === '戸建てリノベ') {
-    if (landAvailability === 'なし') return { col: RESIDENTIAL_EXTRA_COLS.FIRST_ACQUIRER, value: '1' };
-    if (landAvailability === 'あり') return { col: RESIDENTIAL_EXTRA_COLS.OWN_HOUSE,      value: '1' };
+    if (landAvailability === 'なし') activeCol = R.FIRST_ACQUIRER;
+    else if (landAvailability === 'あり') activeCol = R.OWN_HOUSE;
+  } else if (renovationType === '実家リノベ') {
+    activeCol = R.PARENTAL_HOME;
   }
-  if (renovationType === '実家リノベ') return { col: RESIDENTIAL_EXTRA_COLS.PARENTAL_HOME, value: '1' };
-  return { col: RESIDENTIAL_EXTRA_COLS.FIRST_ACQUIRER, value: '' };
+  return _buildFlagEntries([R.FIRST_ACQUIRER, R.OWN_HOUSE, R.PARENTAL_HOME], activeCol);
 }
 
 /**
- * 店舗・賃貸の建設状況から希望種別列を決定する
+ * 店舗・賃貸の建設状況から希望種別フラグ列（A/B/C）を決定する。
+ * 該当列に '1'、他の2列は '' でクリアする。
  * @param {string} type
- * @returns {{ col: number, value: string }}
+ * @returns {Array<{ col: number, value: string }>}
  */
 function _resolveStoreHopeType(type) {
+  const B = BUSINESS_EXTRA_COLS;
   const map = {
-    '入居希望': BUSINESS_EXTRA_COLS.HOPE_TYPE_A,
-    '独立':     BUSINESS_EXTRA_COLS.HOPE_TYPE_A,
-    '大家':     BUSINESS_EXTRA_COLS.HOPE_TYPE_B,
-    '既存店舗': BUSINESS_EXTRA_COLS.HOPE_TYPE_B,
-    '紹介':     BUSINESS_EXTRA_COLS.HOPE_TYPE_C,
-    '新店舗':   BUSINESS_EXTRA_COLS.HOPE_TYPE_C,
+    '入居希望': B.HOPE_TYPE_A,
+    '独立':     B.HOPE_TYPE_A,
+    '大家':     B.HOPE_TYPE_B,
+    '既存店舗': B.HOPE_TYPE_B,
+    '紹介':     B.HOPE_TYPE_C,
+    '新店舗':   B.HOPE_TYPE_C,
   };
-  const col = map[type] ?? BUSINESS_EXTRA_COLS.HOPE_TYPE_A;
-  return { col, value: map[type] ? '1' : '' };
+  return _buildFlagEntries([B.HOPE_TYPE_A, B.HOPE_TYPE_B, B.HOPE_TYPE_C], map[type]);
 }
 
 /**
- * その他業種の建設状況から希望種別列を決定する
+ * その他業種の建設状況から希望種別フラグ列（A/B/C）を決定する。
+ * 該当列に '1'、他の2列は '' でクリアする。
  * @param {string} type
- * @returns {{ col: number, value: string }}
+ * @returns {Array<{ col: number, value: string }>}
  */
 function _resolveOtherHopeType(type) {
+  const B = BUSINESS_EXTRA_COLS;
   const map = {
-    '独立': BUSINESS_EXTRA_COLS.HOPE_TYPE_A,
-    '既存': BUSINESS_EXTRA_COLS.HOPE_TYPE_B,
-    '移転': BUSINESS_EXTRA_COLS.HOPE_TYPE_C,
+    '独立': B.HOPE_TYPE_A,
+    '既存': B.HOPE_TYPE_B,
+    '移転': B.HOPE_TYPE_C,
   };
-  const col = map[type] ?? BUSINESS_EXTRA_COLS.HOPE_TYPE_A;
-  return { col, value: map[type] ? '1' : '' };
+  return _buildFlagEntries([B.HOPE_TYPE_A, B.HOPE_TYPE_B, B.HOPE_TYPE_C], map[type]);
+}
+
+// ============================================================
+// 正規化済みレコードモデル
+// ============================================================
+
+/**
+ * Webhookレコードを、一覧行生成・グラフ集計の両方が受け取れる
+ * 単一の正規化済みモデルへ変換する。
+ *
+ * 設計方針:
+ *   - kintone生レコードの解釈・正規化を「この1関数」に集約する
+ *     （正規化ルールを複数箇所へ複製しない／生レコード参照を分散させない）。
+ *   - 既存の抽出・正規化関数を再利用し、新たな変換ロジックは追加しない
+ *     （＝出力は現行と同一）。
+ *   - 集計年・集計月は transformInquiryDate の結果をそのまま保持する
+ *     （問い合わせ日が空のとき undefined になる点も現行踏襲）。
+ *
+ * 本フェーズでの非対応（将来フェーズ）:
+ *   - recordId はモデルに保持するが、レコードID保存列の追加は行わない。
+ *   - eventType はモデルに保持するが、削除Webhook等の分岐は実装しない。
+ *   - 行識別は引き続き customerName で行う。
+ *
+ * @param {string} appId - kintoneアプリID
+ * @param {Object} record - kintoneレコードオブジェクト
+ * @param {string} [eventType=''] - Webhookイベント種別
+ * @returns {Object} 正規化済みモデル
+ * @throws {Error} 未対応アプリIDの場合
+ */
+function buildNormalizedRecord(appId, record, eventType = '') {
+  const isCustomer = appId === CUSTOMER_APP_ID;
+  const isSales    = appId === SALES_APP_ID;
+
+  const fields = isCustomer ? extractCustomerFields(record)
+               : isSales    ? extractSalesFields(record)
+               : null;
+
+  if (!fields) {
+    throw new Error(`未対応のアプリID: ${appId}`);
+  }
+
+  const customerType  = normalizeCustomerType(fields.customerType);
+  const promotionArea = normalizePromotionArea(fields.promotionArea);
+  const inquiry       = transformInquiryDate(fields.inquiryDate);
+  const sheetArea     = _resolveSheetArea(promotionArea);
+
+  return {
+    // ── Webhook / kintone メタ情報 ──────────────────────────
+    appId,
+    eventType,
+    recordId:  getFieldValue(record, '$id'),        // 将来用（列追加はまだしない）
+    revision:  getFieldValue(record, '$revision'),  // 将来用
+
+    // ── 共通の正規化済み項目 ────────────────────────────────
+    customerName:     fields.customerName,
+    customerType,
+    promotionArea,
+    inquiryDate:      fields.inquiryDate,
+    aggregationYear:  inquiry.year,   // 現行踏襲: 空日付時は undefined
+    aggregationMonth: inquiry.month,
+    rank:             transformRank(fields.likehoodNow),
+    manager:          fields.manager,
+
+    // ── アプリ由来の正規化済み項目（build*RowData がそのまま消費）──
+    customerFields:   isCustomer ? fields : null,
+    salesFields:      isSales    ? fields : null,
+
+    // ── 対象シート名 ────────────────────────────────────────
+    listSheetName:    sheetArea ? buildListSheetName(sheetArea, customerType) : '',
+  };
 }
