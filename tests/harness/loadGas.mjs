@@ -29,6 +29,7 @@ export const CORE_FILES = [
   'Kintone/parser.gs',       // Kintone構造の抽出・パース
   'Kintone/transformer.gs',  // 正規化・行データ生成・モデル
   'Kintone/sheets.gs',       // シート取得・書き込み
+  'Kintone/aggregation.gs',  // ドメインシート集計（全面再計算）
   'Kintone/main.gs',         // エントリ・Webhook制御・振り分け
 ];
 
@@ -53,9 +54,12 @@ const EXPOSED = [
   '_validateRecordByApp', '_extractFieldsByApp', 'extractCustomerFields', 'extractSalesFields',
   'parseWebhookBody',
   // シート名
-  'buildListSheetName',
+  'buildListSheetName', 'buildDomainSheetName',
   // 行探索・書き込み計画
   'planRowWrite', 'applyRowWrite', 'updateRowData',
+  // ドメインシート集計（全面再計算）
+  'buildAggregationWrites', 'resolveAggregationYear', 'computeCurrentAggregationYear',
+  'AGG_ROWS', 'AGG_RESIDENTIAL_ROWS', 'AGG_BUSINESS_ROWS', 'AGG_DOMAINS', 'AGG_AREAS',
 ];
 
 /**
@@ -81,9 +85,25 @@ function buildGasStubs(scriptProps) {
       getScriptTimeZone: () => 'Asia/Tokyo',
     },
     Utilities: {
-      // ログ出力用途のみ。厳密な書式は問わないので ISO 風文字列を返す。
-      formatDate: (date, _tz, _fmt) =>
-        (date instanceof Date ? date.toISOString() : String(date)),
+      // 'yyyy-MM-dd' 系の書式のみ簡易実装（Asia/Tokyo 固定 +9h）。他書式は ISO 風で返す。
+      formatDate: (date, tz, fmt) => {
+        if (!(date instanceof Date)) return String(date);
+        const offsetMs = tz === 'Asia/Tokyo' ? 9 * 3600 * 1000 : 0;
+        const d = new Date(date.getTime() + offsetMs);
+        const pad = (n) => String(n).padStart(2, '0');
+        const parts = {
+          yyyy: d.getUTCFullYear(),
+          MM: pad(d.getUTCMonth() + 1),
+          dd: pad(d.getUTCDate()),
+          HH: pad(d.getUTCHours()),
+          mm: pad(d.getUTCMinutes()),
+          ss: pad(d.getUTCSeconds()),
+        };
+        if (typeof fmt === 'string' && /yyyy/.test(fmt)) {
+          return fmt.replace(/yyyy|MM|dd|HH|mm|ss/g, (m) => parts[m]);
+        }
+        return date.toISOString();
+      },
     },
     ContentService: {
       MimeType: { JSON: 'application/json' },

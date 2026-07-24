@@ -1,8 +1,7 @@
 # tests/ — 特性テスト（characterization tests）
 
-Kintone 連携コード（`.gs`＝Webhook 受信〜一覧シート書き込み）の**挙動を固定**するための開発専用テストです。
+Kintone 連携コード（`.gs`＝Webhook 受信〜一覧シート書き込み、およびドメインシート集計）の**挙動を固定**するための開発専用テストです。
 リファクタリング時に挙動が意図せず変わっていないことを検知する安全網として使います。
-（グラフ集計は削除済み。集計はスプレッドシートの数式で行う方針のため、テスト対象外。）
 
 ## 位置づけ・制約
 
@@ -29,6 +28,7 @@ node --test 'tests/**/*.test.mjs'
 | `characterization/normalizedRecord.test.mjs` | 正規化済みモデル `buildNormalizedRecord` |
 | `characterization/rowData.test.mjs` | 一覧行データ生成（顧客/営業/住宅・新築/法人）。バグA（家族数）・D（分類フラグ）修正を固定 |
 | `characterization/rowSearch.test.mjs` | 行探索・挿入・書き込み。バグB（末尾追加）・C（指定列のみ書込）修正を固定 |
+| `characterization/aggregation.test.mjs` | ドメインシート集計（`aggregation.gs`）。ファネル/月別/担当者別/媒体/エリア/クロス集計/ニーズ/検討レベル/離脱理由/法人系ブロックの書き込み指示と対象年度決定を固定 |
 
 ## 補足
 
