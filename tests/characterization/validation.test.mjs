@@ -51,6 +51,28 @@ test('record 不足', () => {
   assert.throws(() => g.validateWebhookPayload(body), /record/);
 });
 
+test('削除Webhook: 公式形式のrecordIdを受理し、record本体を要求しない', () => {
+  const body = JSON.stringify({
+    app: { id: 20 },
+    type: 'DELETE_RECORD',
+    recordId: '1001',
+  });
+  assert.deepEqual(g.validateWebhookPayload(body), {
+    appId: '20',
+    record: null,
+    recordId: '1001',
+    type: 'DELETE_RECORD',
+  });
+  assert.throws(
+    () => g.validateWebhookPayload(JSON.stringify({
+      app: { id: 20 },
+      type: 'DELETE_RECORD',
+      recordId: '1.5',
+    })),
+    /recordId が不正/
+  );
+});
+
 test('未対応アプリ ID', () => {
   assert.throws(() => g._validateRecordByApp('99', customerRecord()), /未対応のアプリID/);
   assert.throws(() => g._extractFieldsByApp('99', customerRecord()), /未対応のアプリID/);
@@ -66,4 +88,18 @@ test('営業アプリ: 必須フィールド不足（nego_status 欠如）', () 
   const rec = salesRecord();
   delete rec.nego_status;
   assert.throws(() => g.validateSalesRecord(rec), /必須フィールドが不足/);
+});
+
+test('Webhookイベント種別: ADD/UPDATE/DELETEだけを許可する', () => {
+  assert.doesNotThrow(() => g._assertSupportedWebhookEventType('ADD_RECORD'));
+  assert.doesNotThrow(() => g._assertSupportedWebhookEventType('UPDATE_RECORD'));
+  assert.doesNotThrow(() => g._assertSupportedWebhookEventType('DELETE_RECORD'));
+  assert.throws(
+    () => g._assertSupportedWebhookEventType(''),
+    /未対応のWebhookイベント種別/
+  );
+  assert.throws(
+    () => g._assertSupportedWebhookEventType('UNKNOWN_EVENT'),
+    /未対応のWebhookイベント種別/
+  );
 });

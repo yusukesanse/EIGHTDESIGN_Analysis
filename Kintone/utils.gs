@@ -167,7 +167,23 @@ function validateWebhookPayload(rawBody) {
     throw new Error('Webhookペイロードに app.id が存在しません');
   }
 
-  // record の存在確認
+  const type = parsed.type ?? '';
+
+  // 削除通知はrecordオブジェクトではなくrecordIdだけを持つKintone公式形式。
+  if (type === 'DELETE_RECORD') {
+    const recordId = String(parsed.recordId ?? '');
+    if (!/^[1-9]\d*$/.test(recordId) || !Number.isSafeInteger(Number(recordId))) {
+      throw new Error('削除Webhookペイロードの recordId が不正です');
+    }
+    return {
+      appId: String(parsed.app.id),
+      record: null,
+      recordId,
+      type,
+    };
+  }
+
+  // 追加・更新・ステータス変更等はrecordオブジェクトを持つ。
   if (!parsed?.record || typeof parsed.record !== 'object') {
     throw new Error('Webhookペイロードに record が存在しません');
   }
@@ -175,7 +191,8 @@ function validateWebhookPayload(rawBody) {
   return {
     appId:  String(parsed.app.id),
     record: parsed.record,
-    type:   parsed.type ?? '',   // Webhookイベント種別（ADD_RECORD 等）。無ければ空文字。
+    recordId: String(parsed.record?.$id?.value ?? ''),
+    type,
   };
 }
 
@@ -262,14 +279,56 @@ function assertNonEmptyString(value, label) {
 }
 
 /**
+ * 値が10進表記の非負・安全整数文字列であることを確認する。
+ * @param {*} value - 検証する値
+ * @param {string} label - エラーメッセージ用のラベル
+ * @throws {Error} 空文字、符号、小数、指数表記、安全整数範囲外の場合
+ */
+function assertNonNegativeSafeIntegerString(value, label) {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) {
+    throw new Error(`${label} は非負の整数文字列である必要があります`);
+  }
+  if (!Number.isSafeInteger(Number(value))) {
+    throw new Error(`${label} は安全な整数範囲内である必要があります`);
+  }
+}
+
+/**
+ * 値が10進表記の正の安全整数文字列であることを確認する。
+ * @param {*} value
+ * @param {string} label
+ * @throws {Error} 0、空文字、不正形式、安全整数範囲外の場合
+ */
+function assertPositiveSafeIntegerString(value, label) {
+  assertNonNegativeSafeIntegerString(value, label);
+  if (Number(value) < 1) {
+    throw new Error(`${label} は1以上の整数文字列である必要があります`);
+  }
+}
+
+/**
  * 値が有効な日付文字列（YYYY-MM-DD形式）であることを確認する
  * @param {string} value - 検証する値
  * @param {string} label - エラーメッセージ用のラベル
  * @throws {Error} 形式が不正な場合
  */
 function assertDateString(value, label) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) {
     throw new Error(`${label} はYYYY-MM-DD形式である必要があります（現在の値: ${value}）`);
+  }
+
+  const year  = Number(match[1]);
+  const month = Number(match[2]);
+  const day   = Number(match[3]);
+  const date  = new Date(Date.UTC(year, month - 1, day));
+  const isRealDate =
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() + 1 === month &&
+    date.getUTCDate() === day;
+
+  if (!isRealDate) {
+    throw new Error(`${label} は実在する日付である必要があります（現在の値: ${value}）`);
   }
 }
 

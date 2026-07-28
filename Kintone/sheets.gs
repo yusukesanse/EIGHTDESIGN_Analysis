@@ -129,6 +129,59 @@ function getFormattedSheetData(sheet) {
 }
 
 // ============================================================
+// 一覧横断の顧客名出現確認（安定ID移行前の安全ゲート）
+// ============================================================
+
+/**
+ * 18一覧のF列を横断し、顧客名が完全一致する行をすべて返す。
+ * 安定ID導入前に、別target残存や同名複数を成功扱いにしないための検査専用。
+ *
+ * @param {string} customerName
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [spreadsheet]
+ * @returns {Array<{listSheetName: string, rowIndex: number}>}
+ */
+function findCustomerOccurrencesAcrossLists(customerName, spreadsheet) {
+  assertNonEmptyString(customerName, 'customerName');
+  const ss = spreadsheet || getSpreadsheet();
+  const occurrences = [];
+  const seenSheetNames = new Set();
+
+  for (const area of AGG_AREAS) {
+    for (const domain of AGG_DOMAINS) {
+      const listSheetName = buildListSheetName(area, domain.type);
+      if (seenSheetNames.has(listSheetName)) {
+        throw new Error(`一覧シート名が重複しています: ${listSheetName}`);
+      }
+      seenSheetNames.add(listSheetName);
+
+      const sheet = ss.getSheetByName(listSheetName);
+      if (!sheet) {
+        throw new Error(`一覧横断確認の対象シートが見つかりません: ${listSheetName}`);
+      }
+
+      const lastRow = sheet.getLastRow();
+      if (lastRow < 2) continue;
+      const names = sheet
+        .getRange(2, LIST_COL_INDEX.CUSTOMER_NAME + 1, lastRow - 1, 1)
+        .getValues();
+      for (let rowOffset = 0; rowOffset < names.length; rowOffset++) {
+        if (names[rowOffset][0] === customerName) {
+          occurrences.push({
+            listSheetName,
+            rowIndex: rowOffset + 2,
+          });
+        }
+      }
+    }
+  }
+
+  if (seenSheetNames.size !== 18) {
+    throw new Error(`一覧横断確認の対象が18枚ではありません: ${seenSheetNames.size}`);
+  }
+  return occurrences;
+}
+
+// ============================================================
 // 書き込み計画の算出（純粋関数・Range I/O なし）
 // ============================================================
 

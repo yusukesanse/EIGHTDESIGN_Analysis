@@ -28,11 +28,18 @@ node --test 'tests/**/*.test.mjs'
 | `characterization/normalizedRecord.test.mjs` | 正規化済みモデル `buildNormalizedRecord` |
 | `characterization/rowData.test.mjs` | 一覧行データ生成（顧客/営業/住宅・新築/法人）。バグA（家族数）・D（分類フラグ）修正を固定 |
 | `characterization/rowSearch.test.mjs` | 行探索・挿入・書き込み。バグB（末尾追加）・C（指定列のみ書込）修正を固定 |
-| `characterization/aggregation.test.mjs` | ドメインシート集計（`aggregation.gs`）。ファネル/月別/担当者別/媒体/エリア/クロス集計/ニーズ/検討レベル/離脱理由/法人系ブロックの書き込み指示と対象年度決定を固定 |
+| `characterization/aggregation.test.mjs` | 全管理年度の全面再計算、ファネル/月別/担当者別/媒体/エリア/各詳細ブロック、分類不能値の事前停止を固定 |
+| `characterization/ledger.test.mjs` | `_SYNC_EVENTS` / `_SYNC_JOBS` の行形式、revision・最新target参照、ログ値の無害化 |
+| `characterization/reconciliation.test.mjs` | 18一覧横断の欠落・一覧／同一アプリ原本の同名複数・誤配置・所有列不一致・余剰行判定とIDページング |
+| `integration/webhookAggregation.test.mjs` | 一覧更新→flush→対象1組全面再計算→再読込検証→成功／失敗ログの統合経路 |
+| `integration/aggregationLogging.test.mjs` | 定期18組の開始／終了ログ障害を成功扱いにせず、集計元エラーを保持する経路 |
+| `integration/reconciliation.test.mjs` | 実APIへ接続せず、18一覧を変更しないdry-run照合と`_SYNC_DIFFS`一括記録を確認 |
 
 ## 補足
 
-「現状」を記録する特性テストです。書き込み経路の明確なバグ4件（`docs/PROJECT_CONTEXT.md` §11-A の A〜D）は
-**新挙動（正しい挙動）に更新済み**で、対応テストが新挙動を固定しています。未対応の設計課題（顧客名による行識別・
-冪等性・排他制御・匿名アクセス）は §11-B を参照。挙動を変更する場合は該当テストの期待値を「旧→新」として更新し、
-変更理由とともに報告します。
+書き込み経路の明確なバグ4件（`docs/PROJECT_CONTEXT.md` §11-A の A〜D）は
+新挙動を固定済みです。Webhookのrevision冪等性・ScriptLock・更新後一覧からの
+全面再計算も統合テストで固定しています。
+
+一覧行の安定IDと2アプリ間の共通顧客IDは未導入です。地域・ドメイン・顧客名変更と
+削除は誤更新を避けるため成功扱いにせず、dry-run照合後のID移行が必要です。

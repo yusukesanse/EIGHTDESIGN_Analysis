@@ -29,7 +29,9 @@ export const CORE_FILES = [
   'Kintone/parser.gs',       // Kintone構造の抽出・パース
   'Kintone/transformer.gs',  // 正規化・行データ生成・モデル
   'Kintone/sheets.gs',       // シート取得・書き込み
+  'Kintone/ledger.gs',       // Webhook・定期集計の永続実行ログ
   'Kintone/aggregation.gs',  // ドメインシート集計（全面再計算）
+  'Kintone/reconciliation.gs', // Kintone原本と18一覧のdry-run照合
   'Kintone/main.gs',         // エントリ・Webhook制御・振り分け
 ];
 
@@ -52,22 +54,38 @@ const EXPOSED = [
   // 検証・ディスパッチ・パース
   'validateWebhookPayload', 'validateCustomerRecord', 'validateSalesRecord',
   '_validateRecordByApp', '_extractFieldsByApp', 'extractCustomerFields', 'extractSalesFields',
-  'parseWebhookBody',
+  'parseWebhookBody', 'handleWebhook', '_dispatchWrite',
+  '_assertSupportedWebhookEventType', '_recordWebhookFailure',
   // シート名
   'buildListSheetName', 'buildDomainSheetName',
   // 行探索・書き込み計画
   'planRowWrite', 'applyRowWrite', 'updateRowData',
+  'findCustomerOccurrencesAcrossLists',
   // ドメインシート集計（全面再計算）
   'buildAggregationWrites', 'resolveAggregationYear', 'computeCurrentAggregationYear',
+  'runDomainAggregation', 'runDomainAggregationForSheet',
   'AGG_ROWS', 'AGG_RESIDENTIAL_ROWS', 'AGG_BUSINESS_ROWS', 'AGG_DOMAINS', 'AGG_AREAS',
+  // 永続実行ログ
+  'SYNC_LEDGER_HEADERS', 'SYNC_LEDGER_STATUS',
+  'buildSyncSourceKey', 'generateSyncOperationId', 'createSyncOperationContext',
+  'buildSyncLedgerContext', 'buildSyncLedgerRow', 'findLatestSuccessfulRevision',
+  'findLatestSuccessfulEventState',
+  'toSyncLedgerJsonSafe',
+  'recordSyncEvent', 'recordSyncJob', 'recordSyncEventSafe', 'recordSyncJobSafe',
+  'getLatestSuccessfulRevision', 'getLatestSuccessfulEventState',
+  // Kintone原本とのdry-run照合
+  'RECON_DIFF_TYPES', 'RECON_DIFF_HEADERS', 'RECON_PAGE_SIZE',
+  'runKintoneReconciliationDryRun', 'dryRunKintoneReconciliation',
+  'computeKintoneListDiffs', '_reconFetchAllRecords',
 ];
 
 /**
  * GAS プラットフォーム API のテスト用スタブを構築する。
  * 実 API・実データ・秘密情報へは一切アクセスしない。
  * @param {Object<string,string>} scriptProps スクリプトプロパティの疑似値
+ * @param {Object<string,*>} platformOverrides GAS APIスタブの差し替え
  */
-function buildGasStubs(scriptProps) {
+function buildGasStubs(scriptProps, platformOverrides = {}) {
   const props = {
     SPREADSHEET_ID: 'TEST_SPREADSHEET_ID',
     SLACK_WEBHOOK_URL: '',   // 空 → Slack 通知はスキップされる
@@ -75,7 +93,7 @@ function buildGasStubs(scriptProps) {
     ...scriptProps,
   };
 
-  return {
+  const defaults = {
     PropertiesService: {
       getScriptProperties: () => ({
         getProperty: (k) => (k in props ? props[k] : null),
@@ -94,16 +112,19 @@ function buildGasStubs(scriptProps) {
         const parts = {
           yyyy: d.getUTCFullYear(),
           MM: pad(d.getUTCMonth() + 1),
+          M: d.getUTCMonth() + 1,
           dd: pad(d.getUTCDate()),
+          d: d.getUTCDate(),
           HH: pad(d.getUTCHours()),
           mm: pad(d.getUTCMinutes()),
           ss: pad(d.getUTCSeconds()),
         };
         if (typeof fmt === 'string' && /yyyy/.test(fmt)) {
-          return fmt.replace(/yyyy|MM|dd|HH|mm|ss/g, (m) => parts[m]);
+          return fmt.replace(/yyyy|MM|dd|HH|mm|ss|M|d/g, (m) => parts[m]);
         }
         return date.toISOString();
       },
+      getUuid: () => '00000000-0000-4000-8000-000000000001',
     },
     ContentService: {
       MimeType: { JSON: 'application/json' },
@@ -116,12 +137,26 @@ function buildGasStubs(scriptProps) {
     // 以下は本ハーネスのテストでは呼ばない想定。誤使用を検知できるよう明示的に投げる。
     SpreadsheetApp: {
       openById: () => { throw new Error('SpreadsheetApp.openById はテストで使用しない'); },
+      flush: () => {},
     },
     UrlFetchApp: {
       fetch: () => { throw new Error('UrlFetchApp.fetch はテストで使用しない（実 API 禁止）'); },
     },
+    LockService: {
+      getScriptLock: () => ({
+        waitLock: () => {},
+        releaseLock: () => {},
+      }),
+    },
+    ScriptApp: {
+      getProjectTriggers: () => [],
+      deleteTrigger: () => {},
+      newTrigger: () => { throw new Error('ScriptApp.newTrigger はテストで使用しない'); },
+    },
     Logger: { log: () => {} },
   };
+
+  return { ...defaults, ...platformOverrides };
 }
 
 /**
@@ -131,7 +166,12 @@ function buildGasStubs(scriptProps) {
  * ホストと異なり deepStrictEqual が誤検知するため、ホストレルム上の
  * `new Function` ファクトリで評価する（GAS プラットフォーム API は引数で注入）。
  *
- * @param {{ files?: string[], scriptProps?: Object<string,string>, quiet?: boolean }} [opts]
+ * @param {{
+ *   files?: string[],
+ *   scriptProps?: Object<string,string>,
+ *   platformOverrides?: Object<string,*>,
+ *   quiet?: boolean,
+ * }} [opts]
  * @returns {Object} 公開された関数・定数のマップ
  */
 export function loadGas(opts = {}) {
@@ -153,20 +193,21 @@ export function loadGas(opts = {}) {
     ).join('\n') +
     '\nreturn __out;';
 
-  const stubs = buildGasStubs(opts.scriptProps ?? {});
+  const stubs = buildGasStubs(opts.scriptProps ?? {}, opts.platformOverrides ?? {});
   const consoleStub = quiet
     ? { log() {}, info() {}, warn() {}, error() {}, debug() {} }
     : console;
 
   const paramNames = [
     'PropertiesService', 'Session', 'Utilities', 'ContentService',
-    'SpreadsheetApp', 'UrlFetchApp', 'Logger', 'console',
+    'SpreadsheetApp', 'UrlFetchApp', 'LockService', 'ScriptApp', 'Logger', 'console',
   ];
   // eslint-disable-next-line no-new-func
   const factory = new Function(...paramNames, sources.join('\n') + epilogue);
   return factory(
     stubs.PropertiesService, stubs.Session, stubs.Utilities, stubs.ContentService,
-    stubs.SpreadsheetApp, stubs.UrlFetchApp, stubs.Logger, consoleStub,
+    stubs.SpreadsheetApp, stubs.UrlFetchApp, stubs.LockService, stubs.ScriptApp,
+    stubs.Logger, consoleStub,
   );
 }
 
