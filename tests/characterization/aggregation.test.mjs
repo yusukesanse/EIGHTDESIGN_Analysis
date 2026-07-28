@@ -66,11 +66,13 @@ function makeResidentialGrid() {
   setCell(grid, 341, 3, '2026年');
   setCell(grid, 342, 1, '名古屋市中区');
   setCell(grid, 343, 1, '愛知県');
-  setCell(grid, 344, 1, '合計');
+  setCell(grid, 344, 1, 'その他');
+  setCell(grid, 345, 1, '合計');
   setCell(grid, 471, 2, '2025年');
   setCell(grid, 471, 3, '2026年');
   setCell(grid, 472, 1, '名古屋市中区');
-  setCell(grid, 473, 1, '合計');
+  setCell(grid, 473, 1, 'その他');
+  setCell(grid, 474, 1, '合計');
   return grid;
 }
 
@@ -156,13 +158,13 @@ function makeListRow(overrides = {}) {
   set(4, overrides.likehood ?? '長期追客');
   set(6, overrides.name ?? '顧客A');
   set(7, overrides.firstAppoint ?? '');
-  set(9, overrides.media ?? '');
-  set(11, overrides.manager ?? '');
+  set(9, overrides.media ?? '検索');
+  set(11, overrides.manager ?? '田中');
   set(13, overrides.mtg1 ?? '');
   set(14, overrides.mtg2 ?? '');
   set(15, overrides.mtg3 ?? '');
-  set(18, overrides.pref ?? '');
-  set(19, overrides.city ?? '');
+  set(18, overrides.pref ?? '愛知県');
+  set(19, overrides.city ?? '名古屋市中区');
   set(22, overrides.age ?? '');
   set(24, overrides.workPlace ?? '');
   set(25, overrides.industry ?? '');
@@ -187,7 +189,7 @@ function findWrite(writes, row, col) {
 // 住宅系
 // ------------------------------------------------------------
 
-test('住宅系: 年別ファネルは対象年度の列にのみ件数と率を書く', () => {
+test('住宅系: 年別ファネルは全管理年度の列を一覧から再計算する', () => {
   const grid = makeResidentialGrid();
   const listData = [
     makeListRow({ year: '2026年', mtg1: '1月10日', mtg2: '2月1日', rank: 'A', likehood: '成約' }),
@@ -204,8 +206,43 @@ test('住宅系: 年別ファネルは対象年度の列にのみ件数と率を
     [3, 2, 1, 0, 1, 2 / 3, 1 / 2, 0, 1 / 2, 1],
     '反響3/来場2/再来1/3回目0/成約1と各率'
   );
-  // 2025年列（B列）への書き込みは無い
-  assert.strictEqual(findWrite(writes, 35, 2), undefined);
+  // 2025年列（B列）も現在値への差分加算ではなく、2025年一覧行だけから再計算する
+  const previousYear = findWrite(writes, 35, 2);
+  assert.ok(previousYear, '過年度列も再計算対象になる');
+  assert.deepStrictEqual(
+    previousYear.values.map((r) => r[0]),
+    [1, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+    '2025年は反響1/来場1として全面再計算'
+  );
+});
+
+test('住宅系: 年度移動後は旧年度を0、新年度を1へ再計算する', () => {
+  const grid = makeResidentialGrid();
+  // 旧集計値が残っている状態を再現。書き込み計画は現在値を参照せず一覧から作る。
+  setCell(grid, 35, 2, 99);
+  setCell(grid, 35, 3, 0);
+  const listData = [
+    makeListRow({ year: '2026年', month: '1月', name: '年度移動した顧客' }),
+  ];
+
+  const writes = g.buildAggregationWrites(grid, listData, '2026年', 'residential');
+  const oldYear = findWrite(writes, 35, 2);
+  const newYear = findWrite(writes, 35, 3);
+
+  assert.equal(oldYear.values[0][0], 0, '旧年度の反響数を0へ戻す');
+  assert.equal(newYear.values[0][0], 1, '新年度の反響数を1へ更新する');
+});
+
+test('住宅系: 一覧年度に対応する必須年ヘッダーが無ければ失敗する', () => {
+  const grid = makeResidentialGrid();
+  const listData = [
+    makeListRow({ year: '2027年', name: '未定義年度の顧客' }),
+  ];
+
+  assert.throws(
+    () => g.buildAggregationWrites(grid, listData, '2026年', 'residential'),
+    /必須年別ヘッダーが不足/
+  );
 });
 
 test('住宅系: 月別反響数は12ヶ月+計を対象年度の列に書く', () => {
@@ -223,6 +260,32 @@ test('住宅系: 月別反響数は12ヶ月+計を対象年度の列に書く', 
   assert.strictEqual(col[0], 2);   // 1月
   assert.strictEqual(col[11], 1);  // 12月
   assert.strictEqual(col[12], 3);  // 計
+});
+
+test('住宅系: 不正な月は月別合計から黙って落とさず書込前に失敗する', () => {
+  const grid = makeResidentialGrid();
+  assert.throws(
+    () => g.buildAggregationWrites(
+      grid,
+      [makeListRow({ month: '13月' })],
+      '2026年',
+      'residential',
+    ),
+    /月が不正/
+  );
+});
+
+test('住宅系: 未定義ランクは成約判定から黙って落とさず書込前に失敗する', () => {
+  const grid = makeResidentialGrid();
+  assert.throws(
+    () => g.buildAggregationWrites(
+      grid,
+      [makeListRow({ rank: '未知ランク' })],
+      '2026年',
+      'residential',
+    ),
+    /集計可能なランクではない/
+  );
 });
 
 test('住宅系: 担当者別はヘッダーの担当者順+その他+合計で書く', () => {
@@ -249,12 +312,12 @@ test('住宅系: 媒体別は対象年度の列にラベル順+合計で書く�
     makeListRow({ media: '検索', rank: 'A' }),
     makeListRow({ media: '検索' }),
     makeListRow({ media: 'Instagram' }),
-    makeListRow({ media: '未知の媒体' }),  // ラベルに無い → カウントされない
+    makeListRow({ media: '未知の媒体' }),  // ラベルに無い → その他
   ];
   const writes = g.buildAggregationWrites(grid, listData, '2026年', 'residential');
 
   const media = findWrite(writes, 230, 3);
-  assert.deepStrictEqual(media.values, [[2], [1], [0], [3]], '検索2/Instagram1/その他0/合計3');
+  assert.deepStrictEqual(media.values, [[2], [1], [1], [4]], '検索2/Instagram1/その他1/合計4');
 
   const mediaClosed = findWrite(writes, 286, 3);
   assert.deepStrictEqual(mediaClosed.values, [[1], [1]], '成約者は検索1/合計1');
@@ -265,11 +328,11 @@ test('住宅系: エリア別は市区優先・都道府県フォールバック
   const listData = [
     makeListRow({ pref: '愛知県', city: '名古屋市中区' }),  // 市区一致
     makeListRow({ pref: '愛知県', city: '豊田市' }),        // 市区不一致 → 都道府県
-    makeListRow({ pref: '岐阜県', city: '' }),              // どちらも不一致
+    makeListRow({ pref: '岐阜県', city: '' }),              // どちらも不一致 → その他
   ];
   const writes = g.buildAggregationWrites(grid, listData, '2026年', 'residential');
   const area = findWrite(writes, 342, 3);
-  assert.deepStrictEqual(area.values, [[1], [1], [2]], '中区1/愛知県1/合計2');
+  assert.deepStrictEqual(area.values, [[1], [1], [1], [3]], '中区1/愛知県1/その他1/合計3');
 });
 
 test('住宅系: 年収×年齢は反響者(B列)と契約者(M列)の両ブロックを書く', () => {
@@ -369,6 +432,19 @@ test('法人系: 業種×企業規模は不明フォールバック込みで反�
   ]);
   const closed = findWrite(writes, 121, 13);
   assert.deepStrictEqual(closed.values[0], [1, 0, 0, 1], '契約者はランクAのみ');
+});
+
+test('法人系: 受け皿の無い未知媒体は合計から黙って落とさず失敗する', () => {
+  const grid = makeBusinessGrid();
+  assert.throws(
+    () => g.buildAggregationWrites(
+      grid,
+      [makeListRow({ media: '未知の媒体' })],
+      '2026年',
+      'business',
+    ),
+    /反響媒体（全体）で分類できない/
+  );
 });
 
 test('法人系: 業態×業種はフラグ列(希望種別A/B/C)で列を決める', () => {

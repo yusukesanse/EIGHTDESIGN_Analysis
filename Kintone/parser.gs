@@ -9,13 +9,18 @@
 /**
  * WebhookペイロードからアプリID・レコード・イベント種別を取得する
  * @param {string} rawBody - リクエストボディ（JSON文字列）
- * @returns {{ appId: string, record: Object, type: string }}
+ * @returns {{
+ *   appId: string,
+ *   record: (Object|null),
+ *   recordId: string,
+ *   type: string
+ * }}
  * @throws {Error} パース・バリデーションエラー
  */
 function parseWebhookBody(rawBody) {
-  const { appId, record, type } = validateWebhookPayload(rawBody);
+  const { appId, record, recordId, type } = validateWebhookPayload(rawBody);
   AppLogger.info('Webhookパース完了', { appId, type });
-  return { appId, record, type };
+  return { appId, record, recordId, type };
 }
 
 // ============================================================

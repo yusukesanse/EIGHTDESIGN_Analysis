@@ -1,19 +1,21 @@
 // ============================================================
 // aggregation.gs — ドメインシート集計（全面再計算方式）
 // ------------------------------------------------------------
-// 一覧シート（例: 名古屋-一般住宅）を読み直し、対象年度のデータのみを
-// 集計してドメインシート（例: 【一般住宅】名古屋）へ値で書き込む。
+// 一覧シート（例: 名古屋-一般住宅）を読み直し、ドメインシートに存在する
+// 全管理年度と B1 選択年度の詳細ブロックを全面再計算して値で書き込む。
 //
 // 方針（2026-07-24 決定）:
 //   - スプレッドシート数式による集計は廃止し、GAS で全面再計算する
 //   - 差分加算はしない（Webhook とは独立に、毎回一覧シートから数え直す）
-//   - 書き込むのは「対象年度」に関わるセルのみ。過去年の静的値には触れない
-//   - 対象年度はドメインシートの B1（「2026年」形式）を優先し、
+//   - 年別列は過去年を含む全管理年度を再計算し、一覧から消えた値もゼロへ戻す
+//   - 担当者別・詳細ブロックの対象年度はドメインシートの B1（「2026年」形式）を優先し、
 //     無ければ現在日付から集計年度ルール（21日繰り上げ）で算出する
 //
 // エントリポイント:
 //   - runDomainAggregation()            … 18シート全部を再計算（手動実行/トリガー共用）
 //   - runDomainAggregationForSheet(type, area) … 1シートのみ再計算（デバッグ用）
+//   - dryRunDomainAggregation()         … 【書き込まない】18シート分を計算し、現在値との差分をログに出す
+//   - dryRunDomainAggregationForSheet(type, area) … 【書き込まない】1シートの差分を詳細ログに出す
 //   - createAggregationDailyTrigger()   … 毎日7時の定期実行トリガーを作成
 //   - createAggregationHourlyTrigger()  … 毎時の定期実行トリガーを作成
 //   - deleteAggregationTriggers()       … 本集計のトリガーを全削除
@@ -189,8 +191,28 @@ const AGG_TOTAL_LABELS = ['計', '合計'];
 /** その他（受け皿）ラベル */
 const AGG_OTHER_LABEL = 'その他';
 
+/** 一覧シートで集計可能な正規化済みランク */
+const AGG_ALLOWED_RANKS = ['A', 'B-A', 'B-B', 'B-C', 'B-D', 'C', 'D'];
+
 /** 対象年度セルの書式（例: 2026年） */
 const AGG_YEAR_PATTERN = /^20\d{2}年$/;
+
+/**
+ * 年度列を持つ必須ブロック。
+ * 各ブロックに存在する全年度を再計算し、一覧に存在する年度と B1 選択年度は
+ * 全ブロックにヘッダーが存在することを preflight で保証する。
+ */
+const AGG_YEARLY_SECTIONS = [
+  { key: 'funnel',     label: '年別ファネル',   headerRow: AGG_ROWS.FUNNEL_HEADER },
+  { key: 'monthly',    label: '月別反響数',     headerRow: AGG_ROWS.MONTHLY_HEADER },
+  { key: 'mediaAll',   label: '反響媒体（全体）', headerRow: AGG_ROWS.MEDIA_ALL_HEADER },
+  { key: 'mediaClosed', label: '反響媒体（成約）', headerRow: AGG_ROWS.MEDIA_CLOSED_HEADER },
+  { key: 'areaAll',    label: 'エリア（全体）', headerRow: AGG_ROWS.AREA_ALL_HEADER },
+  { key: 'areaClosed', label: 'エリア（成約）', headerRow: AGG_ROWS.AREA_CLOSED_HEADER },
+];
+
+/** 定期集計がWebhookと共有するScriptLockの待機上限 */
+const AGG_LOCK_TIMEOUT_MS = 30000;
 
 // ============================================================
 // エントリポイント
@@ -201,39 +223,384 @@ const AGG_YEAR_PATTERN = /^20\d{2}年$/;
  * 手動実行・定期トリガーの両方から呼ばれる
  */
 function runDomainAggregation() {
+  const startedAtMs = Date.now();
   const ss = getSpreadsheet();
-  const failures = [];
+  const results = [];
+  const jobContext = createSyncOperationContext('FULL_AGGREGATION', {
+    status: 'STARTED',
+    stage: 'START',
+    targetCount: AGG_AREAS.length * AGG_DOMAINS.length,
+  });
+
+  try {
+    _withAggregationScriptLock(() => recordSyncJob(jobContext, ss));
+  } catch (ledgerError) {
+    if (!ledgerError.stage) ledgerError.stage = 'LOG_START';
+    Object.assign(jobContext, {
+      status: 'FAILED',
+      stage: 'LOG_START',
+      elapsedMs: Date.now() - startedAtMs,
+      processedCount: 0,
+      succeededCount: 0,
+      failedCount: 0,
+      error: ledgerError,
+    });
+    _recordAggregationJobFailure(jobContext, ledgerError, ss);
+    throw ledgerError;
+  }
 
   for (const area of AGG_AREAS) {
     for (const domain of AGG_DOMAINS) {
+      const sheetStartedAtMs = Date.now();
       try {
-        _aggregateOneSheet(ss, domain, area);
+        // 1組ごとにロックを解放し、長い18組処理の間にもWebhookが収束できるようにする。
+        results.push(_withAggregationScriptLock(
+          () => _runDomainAggregationForSheet(domain.type, area, ss)
+        ));
       } catch (e) {
-        failures.push(`${buildDomainSheetName(domain.type, area)}: ${e.message}`);
-        AppLogger.error('runDomainAggregation: シート集計でエラー', e, {
-          functionName: 'runDomainAggregation',
-          customerType: domain.type,
+        results.push({
+          status: 'FAILED',
+          success: false,
+          domainType: domain.type,
+          area,
+          listSheetName: buildListSheetName(area, domain.type),
+          domainSheetName: buildDomainSheetName(domain.type, area),
+          targetSheet: e.targetSheet || buildDomainSheetName(domain.type, area),
+          stage: e.stage || 'UNKNOWN',
+          message: e.message,
+          durationMs: e.aggregationResult?.durationMs ?? (Date.now() - sheetStartedAtMs),
         });
       }
     }
   }
 
-  if (failures.length > 0) {
-    AppLogger.error('runDomainAggregation: 一部シートの集計に失敗', null, { failures: failures.join(' / ') });
-  } else {
-    AppLogger.info('runDomainAggregation: 全シート集計完了');
+  const failed = results.filter((result) => !result.success);
+  const succeeded = results.length - failed.length;
+  const summary = {
+    status: failed.length === 0 ? 'SUCCESS' : 'FAILED',
+    success: failed.length === 0,
+    total: results.length,
+    succeeded,
+    failed: failed.length,
+    durationMs: Date.now() - startedAtMs,
+    results,
+  };
+
+  Object.assign(jobContext, {
+    status: failed.length === 0
+      ? 'SUCCEEDED'
+      : (succeeded === 0 ? 'FAILED' : 'PARTIAL_FAILURE'),
+    stage: 'COMPLETE',
+    elapsedMs: summary.durationMs,
+    processedCount: results.length,
+    succeededCount: succeeded,
+    failedCount: failed.length,
+    changedCells: results
+      .filter((result) => result.success)
+      .reduce((sum, result) => sum + (Number(result.cells) || 0), 0),
+    details: { aggregationSummary: summary },
+  });
+
+  if (failed.length > 0) {
+    const error = new Error(
+      `runDomainAggregation: ${failed.length}/${results.length}組の集計に失敗しました`
+    );
+    error.name = 'DomainAggregationBatchError';
+    error.stage = 'BATCH_COMPLETE';
+    error.aggregationSummary = summary;
+    jobContext.error = error;
+
+    try {
+      _withAggregationScriptLock(() => recordSyncJob(jobContext, ss));
+    } catch (ledgerError) {
+      if (!ledgerError.stage) ledgerError.stage = 'LOG_COMPLETE';
+      error.ledgerError = normalizeSyncLedgerError(ledgerError);
+      Object.assign(jobContext, {
+        stage: 'LOG_COMPLETE',
+        error,
+      });
+      _recordAggregationJobFailure(jobContext, error, ss);
+    }
+
+    AppLogger.error('runDomainAggregation: 一部シートの集計に失敗', error, {
+      failed: failed.map((result) =>
+        `${result.domainSheetName}[${result.stage}]: ${result.message}`
+      ).join(' / '),
+      durationMs: summary.durationMs,
+    });
+    throw error;
+  }
+
+  AppLogger.info('runDomainAggregation: 全シート集計完了', {
+    total: summary.total,
+    durationMs: summary.durationMs,
+  });
+  try {
+    _withAggregationScriptLock(() => recordSyncJob(jobContext, ss));
+  } catch (ledgerError) {
+    if (!ledgerError.stage) ledgerError.stage = 'LOG_COMPLETE';
+    Object.assign(jobContext, {
+      status: 'FAILED',
+      stage: 'LOG_COMPLETE',
+      error: ledgerError,
+    });
+    _recordAggregationJobFailure(jobContext, ledgerError, ss);
+    throw ledgerError;
+  }
+  return summary;
+}
+
+/**
+ * 定期処理の永続ログ障害を、元エラーを上書きせず再記録する。
+ * ScriptLock取得自体に失敗した場合もconsole/Loggerへフォールバックする。
+ *
+ * @param {Object} context
+ * @param {*} primaryError
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} spreadsheet
+ * @returns {boolean}
+ * @private
+ */
+function _recordAggregationJobFailure(context, primaryError, spreadsheet) {
+  try {
+    return _withAggregationScriptLock(
+      () => recordSyncJobSafe(context, primaryError, spreadsheet)
+    );
+  } catch (lockError) {
+    try {
+      _syncLedgerConsoleFallback(
+        SYNC_LEDGER_KIND.JOB,
+        context,
+        primaryError,
+        lockError
+      );
+    } catch (fallbackError) {
+      // 元の処理エラーを守るため何も投げない。
+    }
+    return false;
   }
 }
 
 /**
- * 1ドメインシートのみ再計算する（デバッグ・個別実行用）
+ * 定期集計の1組処理、手動個別実行、ジョブログをWebhookの一覧更新から排他する。
+ * Webhookは既に同じScriptLockを保持するため、内部共通経路
+ * `_runDomainAggregationForSheet()` を直接呼ぶ。
+ *
+ * @param {Function} action
+ * @returns {*}
+ */
+function _withAggregationScriptLock(action) {
+  const lock = LockService.getScriptLock();
+  let acquired = false;
+  try {
+    lock.waitLock(AGG_LOCK_TIMEOUT_MS);
+    acquired = true;
+    return action();
+  } catch (error) {
+    if (!acquired && !error.stage) error.stage = 'LOCK_WAIT';
+    throw error;
+  } finally {
+    if (acquired) lock.releaseLock();
+  }
+}
+
+/**
+ * 1ドメインシートのみを厳格に全面再計算する（Webhook・個別実行共用）
+ * @param {string} domainType 顧客種別（例: '一般住宅'）
+ * @param {string} area エリア（'名古屋' or '東京'）
+ * @returns {{
+ *   status: string, success: boolean, domainType: string, area: string,
+ *   listSheetName: string, domainSheetName: string, targetYear: string,
+ *   managedYears: string[], sourceRows: number, blocks: number, cells: number,
+ *   verifiedCells: number, durationMs: number
+ * }}
+ * @throws {Error} 入力・シート構造・書き込み・検証のいずれかに失敗した場合
+ */
+function runDomainAggregationForSheet(domainType, area) {
+  return _withAggregationScriptLock(
+    () => _runDomainAggregationForSheet(domainType, area)
+  );
+}
+
+/**
+ * 個別実行と18組定期実行が共有する経路。
+ * @param {string} domainType
+ * @param {string} area
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} [ss]
+ * @returns {ReturnType<typeof _aggregateOneSheet>}
+ */
+function _runDomainAggregationForSheet(domainType, area, ss) {
+  const startedAtMs = Date.now();
+  let stage = 'VALIDATE_TARGET';
+  let domain;
+
+  try {
+    domain = _resolveAggregationDomain(domainType, area);
+    stage = 'OPEN_SPREADSHEET';
+    const spreadsheet = ss || getSpreadsheet();
+    stage = 'AGGREGATE_SHEET';
+    return _aggregateOneSheet(spreadsheet, domain, area);
+  } catch (e) {
+    const targetSheet = buildDomainSheetName(domainType, area);
+    const error = _annotateAggregationError(e, {
+      stage,
+      targetSheet,
+      domainType,
+      area,
+      durationMs: Date.now() - startedAtMs,
+    });
+    AppLogger.error('runDomainAggregationForSheet: 集計に失敗', error, {
+      domainType,
+      area,
+      targetSheet: error.targetSheet,
+      stage: error.stage,
+      durationMs: error.aggregationResult.durationMs,
+    });
+    throw error;
+  }
+}
+
+// ============================================================
+// ドライラン（書き込まずに現在値との差分をログへ出す動作確認用）
+// ============================================================
+
+/**
+ * 【書き込まない】全ドメインシートを計算し、現在のセル値との差分サマリーをログへ出す
+ * GASエディタから実行し、「実行ログ」で結果を確認する
+ */
+function dryRunDomainAggregation() {
+  const ss = getSpreadsheet();
+  const lines = [];
+  for (const area of AGG_AREAS) {
+    for (const domain of AGG_DOMAINS) {
+      try {
+        const r = _dryRunOneSheet(ss, domain, area, 3);
+        lines.push(r ? `${r.sheet} | 対象年度=${r.targetYear} ブロック=${r.blocks} セル=${r.cells} 差分=${r.diffs}` +
+          (r.samples.length ? ` (例: ${r.samples.join(' , ')})` : '')
+          : `${buildDomainSheetName(domain.type, area)} | スキップ（シートなし）`);
+      } catch (e) {
+        lines.push(`${buildDomainSheetName(domain.type, area)} | エラー: ${e.message}`);
+      }
+    }
+  }
+  AppLogger.info('dryRunDomainAggregation 結果（書き込みはしていません）\n' + lines.join('\n'));
+}
+
+/**
+ * 【書き込まない】1ドメインシートを計算し、差分を詳細ログへ出す
  * @param {string} domainType 顧客種別（例: '一般住宅'）
  * @param {string} area エリア（'名古屋' or '東京'）
  */
-function runDomainAggregationForSheet(domainType, area) {
+function dryRunDomainAggregationForSheet(domainType, area) {
   const domain = AGG_DOMAINS.find((d) => d.type === domainType);
   if (!domain) throw new Error(`未対応のドメインです: ${domainType}`);
-  _aggregateOneSheet(getSpreadsheet(), domain, area);
+  const r = _dryRunOneSheet(getSpreadsheet(), domain, area, 50);
+  if (!r) return;
+  AppLogger.info(
+    `dryRun ${r.sheet} | 対象年度=${r.targetYear} ブロック=${r.blocks} セル=${r.cells} 差分=${r.diffs}\n` +
+    (r.samples.length ? r.samples.join('\n') : '（差分なし: 現在のシート値と完全一致）')
+  );
+}
+
+/**
+ * 1シート分のドライランを実行し、差分サマリーを返す（シートには書き込まない）
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {{ type: string, style: string }} domain
+ * @param {string} area
+ * @param {number} maxSamples ログに載せる差分例の上限
+ * @returns {{ sheet: string, targetYear: string, blocks: number, cells: number, diffs: number, samples: string[] }|null}
+ */
+function _dryRunOneSheet(ss, domain, area, maxSamples) {
+  const listSheet   = ss.getSheetByName(buildListSheetName(area, domain.type));
+  const domainSheet = ss.getSheetByName(buildDomainSheetName(domain.type, area));
+  if (!listSheet || !domainSheet) return null;
+
+  const grid       = domainSheet.getDataRange().getValues();
+  const listData   = listSheet.getDataRange().getValues();
+  const targetYear = resolveAggregationYear(grid);
+  const writes     = buildAggregationWrites(grid, listData, targetYear, domain.style);
+  const diff       = _diffAggregationWrites(grid, writes, maxSamples);
+
+  return {
+    sheet: domainSheet.getName(),
+    targetYear,
+    blocks: writes.length,
+    cells: diff.cells,
+    diffs: diff.diffs,
+    samples: diff.samples,
+  };
+}
+
+/**
+ * 書き込み指示と現在のグリッド値を比較する（純粋関数）
+ * @param {Array<Array<*>>} grid 現在のシート全データ（0始まり）
+ * @param {Array<{ row: number, col: number, values: Array<Array<*>> }>} writes
+ * @param {number} maxSamples 差分例の上限
+ * @returns {{ cells: number, diffs: number, samples: string[] }}
+ */
+function _diffAggregationWrites(grid, writes, maxSamples) {
+  let cells = 0;
+  let diffs = 0;
+  const samples = [];
+  for (const w of writes) {
+    for (let r = 0; r < w.values.length; r++) {
+      for (let c = 0; c < w.values[r].length; c++) {
+        cells++;
+        const current = grid[w.row - 1 + r]?.[w.col - 1 + c] ?? '';
+        const next    = w.values[r][c];
+        if (_aggValuesEqual(current, next)) continue;
+        diffs++;
+        if (samples.length < maxSamples) {
+          samples.push(`${_toA1(w.row + r, w.col + c)}: ${_formatCellForLog(current)} → ${_formatCellForLog(next)}`);
+        }
+      }
+    }
+  }
+  return { cells, diffs, samples };
+}
+
+/**
+ * セル値の実質同値判定（数値は誤差許容、空文字と0は別物として扱う）
+ * @param {*} a
+ * @param {*} b
+ * @returns {boolean}
+ */
+function _aggValuesEqual(a, b) {
+  const aEmpty = a === '' || a === null || a === undefined;
+  const bEmpty = b === '' || b === null || b === undefined;
+  if (aEmpty || bEmpty) return aEmpty === bEmpty;
+  const an = Number(a);
+  const bn = Number(b);
+  if (!Number.isNaN(an) && !Number.isNaN(bn)) return Math.abs(an - bn) < 1e-9;
+  return String(a) === String(b);
+}
+
+/**
+ * 行・列番号（1始まり）をA1形式にする
+ * @param {number} row
+ * @param {number} col
+ * @returns {string}
+ */
+function _toA1(row, col) {
+  let letters = '';
+  let n = col;
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    letters = String.fromCharCode(65 + rem) + letters;
+    n = Math.floor((n - 1) / 26);
+  }
+  return `${letters}${row}`;
+}
+
+/**
+ * ログ表示用にセル値を短く整形する（率は小数4桁へ丸め）
+ * @param {*} v
+ * @returns {string}
+ */
+function _formatCellForLog(v) {
+  if (v === '' || v === null || v === undefined) return '(空)';
+  const n = Number(v);
+  if (!Number.isNaN(n) && !Number.isInteger(n)) return String(Math.round(n * 10000) / 10000);
+  return String(v);
 }
 
 // ============================================================
@@ -271,34 +638,154 @@ function deleteAggregationTriggers() {
 // ============================================================
 
 /**
+ * 対象ドメインとエリアを検証し、ドメイン定義を返す。
+ * 「遠方」は呼び出し元で「名古屋」へ解決済みであることを前提とする。
+ * @param {string} domainType
+ * @param {string} area
+ * @returns {{ type: string, style: string }}
+ */
+function _resolveAggregationDomain(domainType, area) {
+  if (!AGG_AREAS.includes(area)) {
+    throw new Error(`未対応の集計エリアです: ${area}`);
+  }
+  const domain = AGG_DOMAINS.find((candidate) => candidate.type === domainType);
+  if (!domain) {
+    throw new Error(`未対応のドメインです: ${domainType}`);
+  }
+  return domain;
+}
+
+/**
+ * 呼び出し元が処理段階と対象シートを必ず記録できるよう、Errorへ集計情報を付与する。
+ * 既に詳細な段階が付いている場合は上書きしない。
+ * @param {*} cause
+ * @param {{
+ *   stage: string, targetSheet: string, domainType: string, area: string,
+ *   durationMs: number
+ * }} metadata
+ * @returns {Error}
+ */
+function _annotateAggregationError(cause, metadata) {
+  const error = cause instanceof Error ? cause : new Error(String(cause));
+  if (!error.stage) error.stage = metadata.stage;
+  if (!error.targetSheet) error.targetSheet = metadata.targetSheet;
+
+  const existing = error.aggregationResult || {};
+  error.aggregationResult = {
+    status: 'FAILED',
+    success: false,
+    domainType: existing.domainType || metadata.domainType,
+    area: existing.area || metadata.area,
+    targetSheet: existing.targetSheet || error.targetSheet,
+    stage: existing.stage || error.stage,
+    durationMs: existing.durationMs ?? metadata.durationMs,
+    message: existing.message || error.message,
+  };
+  return error;
+}
+
+/**
  * 1シート分の集計を実行する
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
  * @param {{ type: string, style: string }} domain
  * @param {string} area
+ * @returns {{
+ *   status: string, success: boolean, domainType: string, area: string,
+ *   listSheetName: string, domainSheetName: string, targetYear: string,
+ *   managedYears: string[], sourceRows: number, blocks: number, cells: number,
+ *   verifiedCells: number, durationMs: number
+ * }}
  */
 function _aggregateOneSheet(ss, domain, area) {
+  const startedAtMs = Date.now();
   const listSheetName   = buildListSheetName(area, domain.type);
   const domainSheetName = buildDomainSheetName(domain.type, area);
+  let stage = 'RESOLVE_SHEETS';
 
-  const listSheet   = ss.getSheetByName(listSheetName);
-  const domainSheet = ss.getSheetByName(domainSheetName);
-  if (!listSheet || !domainSheet) {
-    AppLogger.warn('_aggregateOneSheet: シートが見つからないためスキップ', {
-      listSheetName, domainSheetName, listFound: !!listSheet, domainFound: !!domainSheet,
+  try {
+    const listSheet = ss.getSheetByName(listSheetName);
+    if (!listSheet) {
+      throw _annotateAggregationError(
+        new Error(`一覧シートが見つかりません: ${listSheetName}`),
+        {
+          stage,
+          targetSheet: listSheetName,
+          domainType: domain.type,
+          area,
+          durationMs: Date.now() - startedAtMs,
+        }
+      );
+    }
+
+    const domainSheet = ss.getSheetByName(domainSheetName);
+    if (!domainSheet) {
+      throw _annotateAggregationError(
+        new Error(`集計シートが見つかりません: ${domainSheetName}`),
+        {
+          stage,
+          targetSheet: domainSheetName,
+          domainType: domain.type,
+          area,
+          durationMs: Date.now() - startedAtMs,
+        }
+      );
+    }
+
+    stage = 'READ_LIST_SHEET';
+    const listData = listSheet.getDataRange().getValues();
+    stage = 'READ_DOMAIN_SHEET';
+    const grid = domainSheet.getDataRange().getValues();
+    const targetYear = resolveAggregationYear(grid);
+
+    stage = 'PREFLIGHT';
+    const preflight = _validateAggregationPreflight(grid, listData, targetYear, domain.style);
+    stage = 'BUILD_WRITES';
+    const plan = _buildAggregationPlan(grid, listData, targetYear, domain.style, preflight);
+    const writeStats = _validateAggregationWrites(plan.writes);
+
+    stage = 'WRITE_VALUES';
+    _applyAggregationWrites(domainSheet, plan.writes);
+    if (typeof SpreadsheetApp !== 'undefined' && typeof SpreadsheetApp.flush === 'function') {
+      SpreadsheetApp.flush();
+    }
+
+    stage = 'VERIFY_WRITES';
+    const writtenGrid = domainSheet.getDataRange().getValues();
+    const verification = _diffAggregationWrites(writtenGrid, plan.writes, 10);
+    if (verification.diffs > 0) {
+      throw new Error(
+        `書き込み後の検証で${verification.diffs}セルの不一致を検出しました` +
+        (verification.samples.length > 0 ? `: ${verification.samples.join(' / ')}` : '')
+      );
+    }
+
+    const result = {
+      status: 'SUCCESS',
+      success: true,
+      domainType: domain.type,
+      area,
+      listSheetName,
+      domainSheetName,
+      targetYear,
+      managedYears: plan.managedYears,
+      sourceRows: plan.sourceRows,
+      blocks: plan.writes.length,
+      cells: writeStats.cells,
+      verifiedCells: verification.cells,
+      durationMs: Date.now() - startedAtMs,
+    };
+
+    AppLogger.info('_aggregateOneSheet: 集計・検証完了', result);
+    return result;
+  } catch (e) {
+    throw _annotateAggregationError(e, {
+      stage,
+      targetSheet: domainSheetName,
+      domainType: domain.type,
+      area,
+      durationMs: Date.now() - startedAtMs,
     });
-    return;
   }
-
-  const grid       = domainSheet.getDataRange().getValues();
-  const listData   = listSheet.getDataRange().getValues();
-  const targetYear = resolveAggregationYear(grid);
-
-  const writes = buildAggregationWrites(grid, listData, targetYear, domain.style);
-  _applyAggregationWrites(domainSheet, writes);
-
-  AppLogger.info('_aggregateOneSheet: 集計完了', {
-    sheet: domainSheetName, targetYear, blocks: writes.length,
-  });
 }
 
 /**
@@ -348,55 +835,542 @@ function computeCurrentAggregationYear(now) {
 
 /**
  * 1シート分の書き込み指示を組み立てる
+ * 年度列を持つブロックは、各ヘッダー行に存在する全管理年度を再計算する。
+ * 担当者別・詳細ブロックだけは targetYear（B1選択年度）を使う。
  * @param {Array<Array<*>>} grid ドメインシートの全データ（0始まり）
  * @param {Array<Array<*>>} listData 一覧シートの全データ（0始まり、ヘッダー行含む）
- * @param {string} targetYear 対象年度（例: '2026年'）
+ * @param {string} targetYear 詳細ブロックの対象年度（例: '2026年'）
  * @param {string} style 'residential' | 'business'
  * @returns {Array<{ row: number, col: number, values: Array<Array<*>> }>}
  */
 function buildAggregationWrites(grid, listData, targetYear, style) {
-  const yearData = listData.filter(
-    (row) => String(row[SALES_LIST_COLS.YEAR - 1]) === targetYear
-  );
-  const closedData = yearData.filter(
-    (row) => String(row[SALES_LIST_COLS.RANK - 1]) === 'A'
-  );
+  const preflight = _validateAggregationPreflight(grid, listData, targetYear, style);
+  const plan = _buildAggregationPlan(grid, listData, targetYear, style, preflight);
+  _validateAggregationWrites(plan.writes);
+  return plan.writes;
+}
 
+/**
+ * preflight済みの入力から1シート分の書き込み計画を組み立てる。
+ * @param {Array<Array<*>>} grid
+ * @param {Array<Array<*>>} listData
+ * @param {string} targetYear
+ * @param {string} style
+ * @param {ReturnType<typeof _validateAggregationPreflight>} [preflight]
+ * @returns {{
+ *   writes: Array<{ row: number, col: number, values: Array<Array<*>> }>,
+ *   targetYear: string, managedYears: string[], sourceRows: number
+ * }}
+ */
+function _buildAggregationPlan(grid, listData, targetYear, style, preflight) {
+  const context = preflight || _validateAggregationPreflight(grid, listData, targetYear, style);
   const writes = [];
-  const push = (w) => { if (w) writes.push(...(Array.isArray(w) ? w : [w])); };
+  const pushRequired = (writeOrWrites, blockName) => {
+    if (!writeOrWrites) {
+      throw new Error(`必須集計ブロックを生成できませんでした: ${blockName}`);
+    }
+    const entries = Array.isArray(writeOrWrites) ? writeOrWrites : [writeOrWrites];
+    if (entries.length === 0) {
+      throw new Error(`必須集計ブロックが空です: ${blockName}`);
+    }
+    writes.push(...entries);
+  };
+  const pushOptional = (writeOrWrites) => {
+    if (!writeOrWrites) return;
+    writes.push(...(Array.isArray(writeOrWrites) ? writeOrWrites : [writeOrWrites]));
+  };
+  const yearSets = new Map();
+  const getYearSet = (year) => {
+    if (!yearSets.has(year)) {
+      const all = context.rowsByYear.get(year) || [];
+      yearSets.set(year, {
+        all,
+        closed: all.filter(
+          (row) => _cellText(row[SALES_LIST_COLS.RANK - 1]) === 'A'
+        ),
+      });
+    }
+    return yearSets.get(year);
+  };
 
-  // ── 共通ブロック ──────────────────────────────────────────
-  push(_buildFunnelWrite(grid, yearData, targetYear));
-  push(_buildMonthlyWrite(grid, yearData, targetYear));
-  push(_buildStaffWrites(grid, yearData));
-  push(_buildLabeledYearColumnWrite(grid, yearData, targetYear, AGG_ROWS.MEDIA_ALL_HEADER, _mediaKeyResolver));
-  push(_buildLabeledYearColumnWrite(grid, closedData, targetYear, AGG_ROWS.MEDIA_CLOSED_HEADER, _mediaKeyResolver));
-  push(_buildLabeledYearColumnWrite(grid, yearData, targetYear, AGG_ROWS.AREA_ALL_HEADER, _areaKeyResolver));
-  push(_buildLabeledYearColumnWrite(grid, closedData, targetYear, AGG_ROWS.AREA_CLOSED_HEADER, _areaKeyResolver));
+  // ── 年別列を持つ共通ブロック（各ブロックの全管理年度）──────
+  for (const { year } of context.yearSections.funnel.columns) {
+    pushRequired(_buildFunnelWrite(grid, getYearSet(year).all, year), `年別ファネル/${year}`);
+  }
+  for (const { year } of context.yearSections.monthly.columns) {
+    pushRequired(_buildMonthlyWrite(grid, getYearSet(year).all, year), `月別反響数/${year}`);
+  }
+  for (const { year } of context.yearSections.mediaAll.columns) {
+    pushRequired(
+      _buildLabeledYearColumnWrite(
+        grid, getYearSet(year).all, year, AGG_ROWS.MEDIA_ALL_HEADER, _mediaKeyResolver
+      ),
+      `反響媒体（全体）/${year}`
+    );
+  }
+  for (const { year } of context.yearSections.mediaClosed.columns) {
+    pushRequired(
+      _buildLabeledYearColumnWrite(
+        grid, getYearSet(year).closed, year, AGG_ROWS.MEDIA_CLOSED_HEADER, _mediaKeyResolver
+      ),
+      `反響媒体（成約）/${year}`
+    );
+  }
+  for (const { year } of context.yearSections.areaAll.columns) {
+    pushRequired(
+      _buildLabeledYearColumnWrite(
+        grid, getYearSet(year).all, year, AGG_ROWS.AREA_ALL_HEADER, _areaKeyResolver
+      ),
+      `エリア（全体）/${year}`
+    );
+  }
+  for (const { year } of context.yearSections.areaClosed.columns) {
+    pushRequired(
+      _buildLabeledYearColumnWrite(
+        grid, getYearSet(year).closed, year, AGG_ROWS.AREA_CLOSED_HEADER, _areaKeyResolver
+      ),
+      `エリア（成約）/${year}`
+    );
+  }
+
+  // ── B1選択年度を使う共通・詳細ブロック ───────────────────
+  const selected = getYearSet(targetYear);
+  pushRequired(_buildStaffWrites(grid, selected.all), '担当者別');
 
   // ── レイアウト別ブロック ──────────────────────────────────
   if (style === 'residential') {
-    push(_buildIncomeAgeWrites(yearData, closedData));
-    push(_buildAgeFamilyWrites(yearData, closedData));
-    push(_buildAttrIndustryWrites(yearData, closedData));
-    push(_buildNeedsWrites(yearData));
-    push(_buildConsiderationWrite(yearData));
-    push(_buildLeavingWrite(grid, yearData));
-    push(_buildYearLabelWrites(grid, targetYear, AGG_RESIDENTIAL_ROWS.YEAR_LABEL_CELLS));
+    pushRequired(_buildIncomeAgeWrites(selected.all, selected.closed), '年収×年齢');
+    pushRequired(_buildAgeFamilyWrites(selected.all, selected.closed), '家族数×年齢');
+    pushRequired(_buildAttrIndustryWrites(selected.all, selected.closed), '属性×業界');
+    pushRequired(_buildNeedsWrites(selected.all), '問い合わせニーズ');
+    pushRequired(_buildConsiderationWrite(selected.all), '検討レベル');
+    pushRequired(_buildLeavingWrite(grid, selected.all), '離脱理由');
+    pushOptional(_buildYearLabelWrites(grid, targetYear, AGG_RESIDENTIAL_ROWS.YEAR_LABEL_CELLS));
   } else {
-    push(_buildCrossMatrixWrites(grid, yearData, closedData, AGG_BUSINESS_ROWS.INDUSTRY_SCALE_HEADER,
+    pushRequired(_buildCrossMatrixWrites(
+      grid, selected.all, selected.closed, AGG_BUSINESS_ROWS.INDUSTRY_SCALE_HEADER,
       (row) => _cellText(row[SALES_LIST_COLS.INDUSTRY - 1]),
-      (row) => _cellText(row[SALES_LIST_COLS.WORK_PLACE - 1])));
-    push(_buildCrossMatrixWrites(grid, yearData, closedData, AGG_BUSINESS_ROWS.JOB_TITLE_HEADER,
+      (row) => _cellText(row[SALES_LIST_COLS.WORK_PLACE - 1])
+    ), '業種×企業規模');
+    pushRequired(_buildCrossMatrixWrites(
+      grid, selected.all, selected.closed, AGG_BUSINESS_ROWS.JOB_TITLE_HEADER,
       (row) => _cellText(row[BUSINESS_EXTRA_COLS.JOB_TITLE - 1]),
-      (row) => _cellText(row[BUSINESS_EXTRA_COLS.CAPITAL_STOCK - 1])));
-    push(_buildTypeNeedsWrite(grid, yearData, AGG_BUSINESS_ROWS.TYPE_NEEDS_HEADER));
-    push(_buildTypeNeedsWrite(grid, closedData, AGG_BUSINESS_ROWS.TYPE_NEEDS_CLOSED_HEADER));
-    push(_buildEventWrite(grid, yearData));
-    push(_buildYearLabelWrites(grid, targetYear, AGG_BUSINESS_ROWS.YEAR_LABEL_CELLS));
+      (row) => _cellText(row[BUSINESS_EXTRA_COLS.CAPITAL_STOCK - 1])
+    ), '肩書×企業規模');
+    pushRequired(
+      _buildTypeNeedsWrite(grid, selected.all, AGG_BUSINESS_ROWS.TYPE_NEEDS_HEADER),
+      '業態×業種（全体）'
+    );
+    pushRequired(
+      _buildTypeNeedsWrite(grid, selected.closed, AGG_BUSINESS_ROWS.TYPE_NEEDS_CLOSED_HEADER),
+      '業態×業種（成約）'
+    );
+    pushRequired(_buildEventWrite(grid, selected.all), '集客イベント');
+    pushOptional(_buildYearLabelWrites(grid, targetYear, AGG_BUSINESS_ROWS.YEAR_LABEL_CELLS));
   }
 
-  return writes;
+  return {
+    writes,
+    targetYear,
+    managedYears: context.managedYears,
+    sourceRows: context.sourceRows,
+  };
+}
+
+/**
+ * 一覧行を年度別へ分割し、年度不正・年度欠落を明示エラーにする。
+ * 先頭行がヘッダーと判定できる場合だけ年度形式チェックから除外する。
+ * @param {Array<Array<*>>} listData
+ * @returns {{ rowsByYear: Map<string, Array<Array<*>>>, years: string[], sourceRows: number }}
+ */
+function _partitionAggregationRowsByYear(listData) {
+  if (!Array.isArray(listData)) {
+    throw new Error('一覧シートデータが配列ではありません');
+  }
+
+  const rowsByYear = new Map();
+  let sourceRows = 0;
+  for (let rowIndex = 0; rowIndex < listData.length; rowIndex++) {
+    const row = listData[rowIndex];
+    if (!Array.isArray(row)) {
+      throw new Error(`一覧シート${rowIndex + 1}行目が配列ではありません`);
+    }
+
+    const year = _cellText(row[SALES_LIST_COLS.YEAR - 1]);
+    const customerName = _cellText(row[SALES_LIST_COLS.CUSTOMER_NAME - 1]);
+    const isHeader = rowIndex === 0 && !AGG_YEAR_PATTERN.test(year) && (
+      /年|年度/.test(year) || /顧客|お客様/.test(customerName)
+    );
+    if (isHeader) continue;
+
+    // 一覧には年度・月の見出し、注記、計行があり得る。顧客名（F列）がある行だけを
+    // 顧客データとして扱い、レイアウト行の文字や数式を年度不正と誤判定しない。
+    if (customerName === '') continue;
+    if (!AGG_YEAR_PATTERN.test(year)) {
+      throw new Error(
+        `一覧シート${rowIndex + 1}行目の年度が不正です: ${year || '(空)'}`
+      );
+    }
+    const month = _cellText(row[SALES_LIST_COLS.MONTH - 1]);
+    if (!/^(?:[1-9]|1[0-2])月$/.test(month)) {
+      throw new Error(
+        `一覧シート${rowIndex + 1}行目の月が不正です: ${month || '(空)'}`
+      );
+    }
+
+    if (!rowsByYear.has(year)) rowsByYear.set(year, []);
+    rowsByYear.get(year).push(row);
+    sourceRows++;
+  }
+
+  const years = [...rowsByYear.keys()].sort(_compareAggregationYears);
+  return { rowsByYear, years, sourceRows };
+}
+
+/**
+ * 年ヘッダー行から管理年度と列位置を取得する。
+ * @param {Array<Array<*>>} grid
+ * @param {{ key: string, label: string, headerRow: number }} section
+ * @returns {{
+ *   key: string, label: string, headerRow: number,
+ *   columns: Array<{ year: string, colIndex: number }>
+ * }}
+ */
+function _readAggregationYearSection(grid, section) {
+  const row = grid[section.headerRow - 1];
+  if (!Array.isArray(row)) {
+    throw new Error(
+      `必須年別ヘッダー行が見つかりません: ${section.label}（${section.headerRow}行）`
+    );
+  }
+
+  const columns = [];
+  const seen = new Set();
+  for (let colIndex = 1; colIndex < row.length; colIndex++) {
+    const year = _cellText(row[colIndex]);
+    if (!AGG_YEAR_PATTERN.test(year)) continue;
+    if (seen.has(year)) {
+      throw new Error(
+        `年別ヘッダーが重複しています: ${section.label}/${year}`
+      );
+    }
+    seen.add(year);
+    columns.push({ year, colIndex });
+  }
+
+  if (columns.length === 0) {
+    throw new Error(
+      `必須年別ヘッダーが見つかりません: ${section.label}（${section.headerRow}行）`
+    );
+  }
+  return { ...section, columns };
+}
+
+/**
+ * 年度文字列を昇順比較する。
+ * @param {string} a
+ * @param {string} b
+ * @returns {number}
+ */
+function _compareAggregationYears(a, b) {
+  return Number(a.slice(0, 4)) - Number(b.slice(0, 4));
+}
+
+/**
+ * ラベル参照型の必須セクションが存在し、合計行/列まで揃っていることを検証する。
+ * @param {Array<Array<*>>} grid
+ * @param {string} style
+ */
+function _validateRequiredAggregationSections(grid, style) {
+  const staff = _scanHeaderLabels(grid, AGG_ROWS.STAFF_HEADER, 1);
+  if (staff.labels.length === 0 || !staff.hasTotal) {
+    throw new Error(
+      `担当者別の必須ヘッダーまたは合計列がありません（${AGG_ROWS.STAFF_HEADER}行）`
+    );
+  }
+
+  for (const section of [
+    { label: '反響媒体（全体）', headerRow: AGG_ROWS.MEDIA_ALL_HEADER },
+    { label: '反響媒体（成約）', headerRow: AGG_ROWS.MEDIA_CLOSED_HEADER },
+    { label: 'エリア（全体）', headerRow: AGG_ROWS.AREA_ALL_HEADER },
+    { label: 'エリア（成約）', headerRow: AGG_ROWS.AREA_CLOSED_HEADER },
+  ]) {
+    const scanned = _scanLabels(grid, section.headerRow + 1, 0, 120);
+    if (scanned.labels.length === 0 || !scanned.hasTotal) {
+      throw new Error(
+        `${section.label}の必須ラベルまたは合計行がありません（${section.headerRow + 1}行以降）`
+      );
+    }
+  }
+
+  if (style === 'residential') {
+    const leaving = _scanLabels(
+      grid, AGG_RESIDENTIAL_ROWS.LEAVING_START, 11, 30
+    );
+    if (leaving.labels.length === 0 || !leaving.hasTotal) {
+      throw new Error('離脱理由の必須ラベルまたは合計行がありません');
+    }
+    return;
+  }
+
+  for (const section of [
+    { label: '業種×企業規模', headerRow: AGG_BUSINESS_ROWS.INDUSTRY_SCALE_HEADER },
+    { label: '肩書×企業規模', headerRow: AGG_BUSINESS_ROWS.JOB_TITLE_HEADER },
+  ]) {
+    const rowLabels = _scanLabels(grid, section.headerRow + 1, 0, 40);
+    const colLabels = _scanHeaderLabels(grid, section.headerRow, 1);
+    if (
+      rowLabels.labels.length === 0 || !rowLabels.hasTotal ||
+      colLabels.labels.length === 0 || !colLabels.hasTotal
+    ) {
+      throw new Error(`${section.label}の必須行列ヘッダーまたは合計がありません`);
+    }
+  }
+
+  for (const section of [
+    { label: '業態×業種（全体）', headerRow: AGG_BUSINESS_ROWS.TYPE_NEEDS_HEADER },
+    { label: '業態×業種（成約）', headerRow: AGG_BUSINESS_ROWS.TYPE_NEEDS_CLOSED_HEADER },
+  ]) {
+    const rowLabels = _scanLabels(grid, section.headerRow + 1, 0, 40);
+    const colLabels = _scanHeaderLabels(grid, section.headerRow, 1);
+    if (
+      rowLabels.labels.length === 0 || !rowLabels.hasTotal ||
+      colLabels.labels.length !== 3 || !colLabels.hasTotal
+    ) {
+      throw new Error(`${section.label}の必須業種・業態ヘッダーまたは合計がありません`);
+    }
+  }
+
+  const events = _scanHeaderLabels(grid, AGG_BUSINESS_ROWS.EVENT_HEADER, 12);
+  if (events.labels.length === 0 || !events.hasTotal) {
+    throw new Error('集客イベントの必須ヘッダーまたは合計列がありません');
+  }
+}
+
+/**
+ * 書き込み前に、年度・必須セクション・一覧行を一括検証する。
+ * @param {Array<Array<*>>} grid
+ * @param {Array<Array<*>>} listData
+ * @param {string} targetYear
+ * @param {string} style
+ * @returns {{
+ *   rowsByYear: Map<string, Array<Array<*>>>, listYears: string[],
+ *   managedYears: string[], sourceRows: number,
+ *   yearSections: Object<string, {
+ *     key: string, label: string, headerRow: number,
+ *     columns: Array<{ year: string, colIndex: number }>
+ *   }>
+ * }}
+ */
+function _validateAggregationPreflight(grid, listData, targetYear, style) {
+  if (!Array.isArray(grid) || grid.length === 0) {
+    throw new Error('集計シートデータが空です');
+  }
+  if (!AGG_YEAR_PATTERN.test(_cellText(targetYear))) {
+    throw new Error(`詳細ブロックの対象年度が不正です: ${targetYear}`);
+  }
+  if (style !== 'residential' && style !== 'business') {
+    throw new Error(`未対応の集計レイアウトです: ${style}`);
+  }
+
+  const partitioned = _partitionAggregationRowsByYear(listData);
+  const requiredYears = [...new Set([...partitioned.years, targetYear])]
+    .sort(_compareAggregationYears);
+  const yearSections = {};
+  const managedYearSet = new Set();
+
+  for (const definition of AGG_YEARLY_SECTIONS) {
+    const section = _readAggregationYearSection(grid, definition);
+    const availableYears = new Set(section.columns.map((column) => column.year));
+    const missingYears = requiredYears.filter((year) => !availableYears.has(year));
+    if (missingYears.length > 0) {
+      throw new Error(
+        `必須年別ヘッダーが不足しています: ${section.label}` +
+        `（${section.headerRow}行）不足=${missingYears.join(', ')}`
+      );
+    }
+    for (const { year } of section.columns) managedYearSet.add(year);
+    yearSections[section.key] = section;
+  }
+
+  _validateRequiredAggregationSections(grid, style);
+  _validateAggregationInputCoverage(grid, partitioned.rowsByYear, style);
+
+  return {
+    rowsByYear: partitioned.rowsByYear,
+    listYears: partitioned.years,
+    managedYears: [...managedYearSet].sort(_compareAggregationYears),
+    sourceRows: partitioned.sourceRows,
+    yearSections,
+  };
+}
+
+/**
+ * ラベル別集計で一覧行が黙って欠落しないことを、書き込み前に検証する。
+ * 「その他」列/行がある場合はそこへ集約し、受け皿が無い場合は明示的に失敗する。
+ * @param {Array<Array<*>>} grid
+ * @param {Map<string, Array<Array<*>>>} rowsByYear
+ * @param {string} style
+ */
+function _validateAggregationInputCoverage(grid, rowsByYear, style) {
+  const allRows = [];
+  for (const rows of rowsByYear.values()) allRows.push(...rows);
+  if (allRows.length === 0) return;
+
+  const closedRows = allRows.filter(
+    row => _cellText(row[SALES_LIST_COLS.RANK - 1]) === 'A'
+  );
+  const invalidRanks = allRows.filter(row =>
+    !AGG_ALLOWED_RANKS.includes(_cellText(row[SALES_LIST_COLS.RANK - 1]))
+  ).length;
+  if (invalidRanks > 0) {
+    throw new Error(`集計可能なランクではない一覧行があります: ${invalidRanks}件`);
+  }
+
+  const labeledSections = [
+    {
+      label: '反響媒体（全体）',
+      headerRow: AGG_ROWS.MEDIA_ALL_HEADER,
+      rows: allRows,
+      resolver: _mediaKeyResolver,
+    },
+    {
+      label: '反響媒体（成約）',
+      headerRow: AGG_ROWS.MEDIA_CLOSED_HEADER,
+      rows: closedRows,
+      resolver: _mediaKeyResolver,
+    },
+    {
+      label: 'エリア（全体）',
+      headerRow: AGG_ROWS.AREA_ALL_HEADER,
+      rows: allRows,
+      resolver: _areaKeyResolver,
+    },
+    {
+      label: 'エリア（成約）',
+      headerRow: AGG_ROWS.AREA_CLOSED_HEADER,
+      rows: closedRows,
+      resolver: _areaKeyResolver,
+    },
+  ];
+
+  for (const section of labeledSections) {
+    const { labels } = _scanLabels(grid, section.headerRow + 1, 0, 120);
+    const unresolved = section.rows.filter(
+      row => section.resolver(row, labels) === -1
+    ).length;
+    if (unresolved > 0) {
+      throw new Error(
+        `${section.label}で分類できない一覧行があります: ${unresolved}件`
+      );
+    }
+  }
+
+  const staff = _scanHeaderLabels(grid, AGG_ROWS.STAFF_HEADER, 1);
+  if (!staff.labels.includes(AGG_OTHER_LABEL)) {
+    const unresolvedStaff = allRows.filter(row =>
+      !staff.labels.includes(_cellText(row[SALES_LIST_COLS.MANAGER - 1]))
+    ).length;
+    if (unresolvedStaff > 0) {
+      throw new Error(
+        `担当者別に「${AGG_OTHER_LABEL}」列がなく、分類できない一覧行があります: ` +
+        `${unresolvedStaff}件`
+      );
+    }
+  }
+
+  if (style !== 'residential') return;
+
+  const unknownConsideration = allRows.filter(row =>
+    AGG_CONSIDERATION_MAP[_cellText(row[SALES_LIST_COLS.LIKEHOOD - 1])] === undefined
+  ).length;
+  if (unknownConsideration > 0) {
+    throw new Error(
+      `検討レベルに分類できない一覧行があります: ${unknownConsideration}件`
+    );
+  }
+
+  for (const block of AGG_RESIDENTIAL_ROWS.NEEDS_BLOCKS) {
+    const unresolvedNeeds = allRows.filter(row =>
+      _hasValue(row[block.filterCol - 1]) &&
+      !AGG_NEEDS_APPOINTS.includes(
+        _cellText(row[CUSTOMER_LIST_COLS.FIRST_APPOINT - 1])
+      )
+    ).length;
+    if (unresolvedNeeds > 0) {
+      throw new Error(
+        `問い合わせニーズに分類できない一覧行があります: ${unresolvedNeeds}件`
+      );
+    }
+  }
+
+  const { labels: leavingReasons } = _scanLabels(
+    grid,
+    AGG_RESIDENTIAL_ROWS.LEAVING_START,
+    11,
+    30
+  );
+  const unresolvedReasons = allRows.filter(row => {
+    const reason = _cellText(row[RESIDENTIAL_EXTRA_COLS.REASON - 1]);
+    return reason !== '' && !leavingReasons.includes(reason);
+  }).length;
+  if (unresolvedReasons > 0) {
+    throw new Error(
+      `離脱理由に分類できない一覧行があります: ${unresolvedReasons}件`
+    );
+  }
+}
+
+/**
+ * 書き込み指示が非空・矩形・非重複で、有限数値だけを含むことを検証する。
+ * @param {Array<{ row: number, col: number, values: Array<Array<*>> }>} writes
+ * @returns {{ cells: number }}
+ */
+function _validateAggregationWrites(writes) {
+  if (!Array.isArray(writes) || writes.length === 0) {
+    throw new Error('集計書き込み指示が空です');
+  }
+
+  const occupied = new Set();
+  let cells = 0;
+  for (let writeIndex = 0; writeIndex < writes.length; writeIndex++) {
+    const write = writes[writeIndex];
+    if (
+      !write || !Number.isInteger(write.row) || write.row < 1 ||
+      !Number.isInteger(write.col) || write.col < 1 ||
+      !Array.isArray(write.values) || write.values.length === 0 ||
+      !Array.isArray(write.values[0]) || write.values[0].length === 0
+    ) {
+      throw new Error(`集計書き込み指示${writeIndex + 1}件目の形式が不正です`);
+    }
+
+    const width = write.values[0].length;
+    for (let rowOffset = 0; rowOffset < write.values.length; rowOffset++) {
+      const valueRow = write.values[rowOffset];
+      if (!Array.isArray(valueRow) || valueRow.length !== width) {
+        throw new Error(`集計書き込み指示${writeIndex + 1}件目が矩形ではありません`);
+      }
+      for (let colOffset = 0; colOffset < width; colOffset++) {
+        const value = valueRow[colOffset];
+        if (typeof value === 'number' && !Number.isFinite(value)) {
+          throw new Error(
+            `集計書き込み指示に有限でない数値があります: ` +
+            `${_toA1(write.row + rowOffset, write.col + colOffset)}`
+          );
+        }
+        const cellKey = `${write.row + rowOffset}:${write.col + colOffset}`;
+        if (occupied.has(cellKey)) {
+          throw new Error(
+            `集計書き込み指示が重複しています: ` +
+            `${_toA1(write.row + rowOffset, write.col + colOffset)}`
+          );
+        }
+        occupied.add(cellKey);
+        cells++;
+      }
+    }
+  }
+  return { cells };
 }
 
 // ============================================================
@@ -534,8 +1508,7 @@ function _countFunnel(yearData) {
 function _buildFunnelWrite(grid, yearData, targetYear) {
   const colIndex = _findYearColumn(grid, AGG_ROWS.FUNNEL_HEADER, targetYear);
   if (colIndex === -1) {
-    AppLogger.warn('_buildFunnelWrite: 対象年度の列が見つかりません', { targetYear });
-    return null;
+    throw new Error(`年別ファネルの対象年度列が見つかりません: ${targetYear}`);
   }
   const c = _countFunnel(yearData);
   const values = [
@@ -563,8 +1536,7 @@ function _buildFunnelWrite(grid, yearData, targetYear) {
 function _buildMonthlyWrite(grid, yearData, targetYear) {
   const colIndex = _findYearColumn(grid, AGG_ROWS.MONTHLY_HEADER, targetYear);
   if (colIndex === -1) {
-    AppLogger.warn('_buildMonthlyWrite: 対象年度の列が見つかりません', { targetYear });
-    return null;
+    throw new Error(`月別反響数の対象年度列が見つかりません: ${targetYear}`);
   }
   const counts = new Array(12).fill(0);
   for (const row of yearData) {
@@ -594,15 +1566,19 @@ function _buildMonthlyWrite(grid, yearData, targetYear) {
 function _buildStaffWrites(grid, yearData) {
   const headerRow = grid[AGG_ROWS.STAFF_HEADER - 1] ?? [];
   const columns = [];  // { kind: 'staff'|'other'|'total', name }
+  let hasTotal = false;
   for (let i = 1; i < headerRow.length; i++) {
     const label = _cellText(headerRow[i]);
     if (label === '') break;
-    if (AGG_TOTAL_LABELS.includes(label)) { columns.push({ kind: 'total' }); break; }
+    if (AGG_TOTAL_LABELS.includes(label)) {
+      columns.push({ kind: 'total' });
+      hasTotal = true;
+      break;
+    }
     columns.push(label === AGG_OTHER_LABEL ? { kind: 'other' } : { kind: 'staff', name: label });
   }
-  if (columns.length === 0) {
-    AppLogger.warn('_buildStaffWrites: 担当者ヘッダーが見つかりません', {});
-    return null;
+  if (columns.length === 0 || !hasTotal) {
+    throw new Error('担当者別の必須ヘッダーまたは合計列が見つかりません');
   }
 
   const staffNames = columns.filter((c) => c.kind === 'staff').map((c) => c.name);
@@ -645,13 +1621,14 @@ function _buildStaffWrites(grid, yearData) {
 // ============================================================
 
 /**
- * 反響媒体のキー解決（完全一致のみ。ラベルに無い媒体はカウントしない）
+ * 反響媒体のキー解決（完全一致。無ければ「その他」へ集約）
  * @param {Array<*>} row
  * @param {string[]} labels
  * @returns {number} ラベルインデックス（-1 なら対象外）
  */
 function _mediaKeyResolver(row, labels) {
-  return labels.indexOf(_cellText(row[CUSTOMER_LIST_COLS.INFO_ROUTE - 1]));
+  const idx = labels.indexOf(_cellText(row[CUSTOMER_LIST_COLS.INFO_ROUTE - 1]));
+  return idx !== -1 ? idx : labels.indexOf(AGG_OTHER_LABEL);
 }
 
 /**
@@ -667,7 +1644,11 @@ function _areaKeyResolver(row, labels) {
     if (idx !== -1) return idx;
   }
   const pref = _cellText(row[SALES_LIST_COLS.PREFECTURE - 1]);
-  return pref === '' ? -1 : labels.indexOf(pref);
+  if (pref !== '') {
+    const idx = labels.indexOf(pref);
+    if (idx !== -1) return idx;
+  }
+  return labels.indexOf(AGG_OTHER_LABEL);
 }
 
 /**
@@ -682,13 +1663,15 @@ function _areaKeyResolver(row, labels) {
 function _buildLabeledYearColumnWrite(grid, dataSet, targetYear, headerRow, keyResolver) {
   const colIndex = _findYearColumn(grid, headerRow, targetYear);
   if (colIndex === -1) {
-    AppLogger.warn('_buildLabeledYearColumnWrite: 対象年度の列が見つかりません', { headerRow, targetYear });
-    return null;
+    throw new Error(
+      `ラベル別集計の対象年度列が見つかりません: ${headerRow}行/${targetYear}`
+    );
   }
   const { labels, hasTotal } = _scanLabels(grid, headerRow + 1, 0, 120);
-  if (labels.length === 0) {
-    AppLogger.warn('_buildLabeledYearColumnWrite: ラベルが見つかりません', { headerRow });
-    return null;
+  if (labels.length === 0 || !hasTotal) {
+    throw new Error(
+      `ラベル別集計の必須ラベルまたは合計行が見つかりません: ${headerRow + 1}行以降`
+    );
   }
 
   const counts = new Array(labels.length).fill(0);
@@ -895,9 +1878,8 @@ function _buildConsiderationWrite(yearData) {
 function _buildLeavingWrite(grid, yearData) {
   const { labels: reasons, hasTotal } = _scanLabels(grid, AGG_RESIDENTIAL_ROWS.LEAVING_START, 11, 30);
   const { labels: staffList } = _scanHeaderLabels(grid, AGG_RESIDENTIAL_ROWS.LEAVING_HEADER, 13);
-  if (reasons.length === 0) {
-    AppLogger.warn('_buildLeavingWrite: 離脱理由ラベルが見つかりません', {});
-    return null;
+  if (reasons.length === 0 || !hasTotal) {
+    throw new Error('離脱理由の必須ラベルまたは合計行が見つかりません');
   }
 
   // rows: 理由ごと + 合計行 / cols: 理由総数 + 担当者ごと
@@ -945,9 +1927,13 @@ function _buildLeavingWrite(grid, yearData) {
 function _buildCrossMatrixWrites(grid, yearData, closedData, headerRow, rowValueGetter, colValueGetter) {
   const { labels: rowLabels, hasTotal: hasTotalRow } = _scanLabels(grid, headerRow + 1, 0, 40);
   const { labels: colLabels, hasTotal: hasTotalCol } = _scanHeaderLabels(grid, headerRow, 1);
-  if (rowLabels.length === 0 || colLabels.length === 0) {
-    AppLogger.warn('_buildCrossMatrixWrites: ラベルが見つかりません', { headerRow });
-    return [];
+  if (
+    rowLabels.length === 0 || colLabels.length === 0 ||
+    !hasTotalRow || !hasTotalCol
+  ) {
+    throw new Error(
+      `クロス集計の必須行列ヘッダーまたは合計が見つかりません: ${headerRow}行`
+    );
   }
   const resolve = (value, labels) => {
     const idx = labels.indexOf(value);
@@ -990,9 +1976,14 @@ const AGG_TYPE_NEEDS_FLAG_COLS = [
  */
 function _buildTypeNeedsWrite(grid, dataSet, headerRow) {
   const { labels: typeLabels, hasTotal } = _scanLabels(grid, headerRow + 1, 0, 40);
-  if (typeLabels.length === 0) {
-    AppLogger.warn('_buildTypeNeedsWrite: 業種ラベルが見つかりません', { headerRow });
-    return null;
+  const { labels: needLabels, hasTotal: hasNeedsTotal } = _scanHeaderLabels(grid, headerRow, 1);
+  if (
+    typeLabels.length === 0 || !hasTotal ||
+    needLabels.length !== AGG_TYPE_NEEDS_FLAG_COLS.length || !hasNeedsTotal
+  ) {
+    throw new Error(
+      `業態×業種の必須ヘッダーまたは合計が見つかりません: ${headerRow}行`
+    );
   }
   const needsCount = AGG_TYPE_NEEDS_FLAG_COLS.length;
   const resolveNeeds = (row) => {
@@ -1038,9 +2029,8 @@ function _buildTypeNeedsWrite(grid, dataSet, headerRow) {
  */
 function _buildEventWrite(grid, yearData) {
   const { labels: items, hasTotal } = _scanHeaderLabels(grid, AGG_BUSINESS_ROWS.EVENT_HEADER, 12);
-  if (items.length === 0) {
-    AppLogger.warn('_buildEventWrite: イベント項目が見つかりません', {});
-    return null;
+  if (items.length === 0 || !hasTotal) {
+    throw new Error('集客イベントの必須ヘッダーまたは合計列が見つかりません');
   }
   const n = items.length;
   const res = new Array(n + 1).fill(0);

@@ -363,10 +363,9 @@ function _resolveOtherHopeType(type) {
  *   - 集計年・集計月は transformInquiryDate の結果をそのまま保持する
  *     （問い合わせ日が空のとき undefined になる点も現行踏襲）。
  *
- * 本フェーズでの非対応（将来フェーズ）:
- *   - recordId はモデルに保持するが、レコードID保存列の追加は行わない。
- *   - eventType はモデルに保持するが、削除Webhook等の分岐は実装しない。
- *   - 行識別は引き続き customerName で行う。
+ * recordId / revision / eventType は Webhook の冪等性・監査用メタ情報として保持する。
+ * 一覧シートの既存レイアウトにはレコードID列がないため、行識別自体は引き続き
+ * customerName を使用する。sourceKey は処理ログ・将来のID移行に利用する。
  *
  * @param {string} appId - kintoneアプリID
  * @param {Object} record - kintoneレコードオブジェクト
@@ -386,17 +385,32 @@ function buildNormalizedRecord(appId, record, eventType = '') {
     throw new Error(`未対応のアプリID: ${appId}`);
   }
 
+  assertNonEmptyString(fields.customerName, 'customerName');
+  assertDateString(fields.inquiryDate, 'inquiryDate');
+
   const customerType  = normalizeCustomerType(fields.customerType);
   const promotionArea = normalizePromotionArea(fields.promotionArea);
   const inquiry       = transformInquiryDate(fields.inquiryDate);
   const sheetArea     = _resolveSheetArea(promotionArea);
+  const recordId      = getFieldValue(record, '$id');
+  const revision      = getFieldValue(record, '$revision');
+
+  if (!customerType) {
+    throw new Error(`未対応の顧客種別です: ${fields.customerType}`);
+  }
+  if (!sheetArea) {
+    throw new Error(`未対応の販促エリアです: ${promotionArea}`);
+  }
+  assertPositiveSafeIntegerString(recordId, '$id');
+  assertNonNegativeSafeIntegerString(revision, '$revision');
 
   return {
     // ── Webhook / kintone メタ情報 ──────────────────────────
     appId,
     eventType,
-    recordId:  getFieldValue(record, '$id'),        // 将来用（列追加はまだしない）
-    revision:  getFieldValue(record, '$revision'),  // 将来用
+    recordId,
+    revision,
+    sourceKey: `${appId}:${recordId}`,
 
     // ── 共通の正規化済み項目 ────────────────────────────────
     customerName:     fields.customerName,
@@ -413,6 +427,7 @@ function buildNormalizedRecord(appId, record, eventType = '') {
     salesFields:      isSales    ? fields : null,
 
     // ── 対象シート名 ────────────────────────────────────────
-    listSheetName:    sheetArea ? buildListSheetName(sheetArea, customerType) : '',
+    sheetArea,
+    listSheetName:    buildListSheetName(sheetArea, customerType),
   };
 }
