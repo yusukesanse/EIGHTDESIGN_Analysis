@@ -65,6 +65,8 @@ const EXPOSED = [
   'buildAggregationWrites', 'resolveAggregationYear', 'computeCurrentAggregationYear',
   'runDomainAggregation', 'runDomainAggregationForSheet',
   'AGG_ROWS', 'AGG_RESIDENTIAL_ROWS', 'AGG_BUSINESS_ROWS', 'AGG_DOMAINS', 'AGG_AREAS',
+  'AGG_UNKNOWN_LABELS', 'AGG_AREA_UNKNOWN_LABELS',
+  '_mediaKeyResolver', '_areaKeyResolver', '_findLabelIndexIgnoreCase',
   // 永続実行ログ
   'SYNC_LEDGER_HEADERS', 'SYNC_LEDGER_STATUS',
   'buildSyncSourceKey', 'generateSyncOperationId', 'createSyncOperationContext',

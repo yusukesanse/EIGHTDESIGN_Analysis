@@ -94,6 +94,12 @@ function makeResidentialDomainGrid(year) {
     setCell(grid, headerRow + 3, 1, 'その他');
     setCell(grid, headerRow + 4, 1, '合計');
   }
+  // 問い合わせニーズ（実シートどおり 177/185/193 がヘッダー、B〜が種別、末尾が計）
+  for (const [needsHeaderRow, needsLabel] of [[177, '一次取得'], [185, '持家'], [193, '実家など']]) {
+    setCell(grid, needsHeaderRow, 1, needsLabel);
+    ['相談会', '個別相談', '外部相談会', '見学会', '資料請求', '計']
+      .forEach((name, index) => setCell(grid, needsHeaderRow, 2 + index, name));
+  }
   return grid;
 }
 

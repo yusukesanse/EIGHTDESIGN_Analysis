@@ -199,6 +199,22 @@ const AGG_OTHER_LABEL = 'その他';
  */
 const AGG_UNKNOWN_LABELS = [AGG_OTHER_LABEL, '不明'];
 
+/**
+ * エリア別ブロック専用の受け皿ラベル（優先順）。
+ * 実シートのエリアブロックには「その他」「不明」行が無く、末尾側の
+ * 「他都道府県」が唯一の受け皿になる（2026-07-28 決定）。
+ * 顧客情報アプリのWebhookは希望エリア列（18・19列）を書かないため、
+ * 営業側の更新が来るまでエリアは空欄であり、受け皿が無いと集計できない。
+ */
+const AGG_AREA_UNKNOWN_LABELS = [AGG_OTHER_LABEL, '不明', '他都道府県'];
+
+/**
+ * 離脱理由ブロック専用の受け皿ラベル（優先順）。
+ * 実シートの理由一覧に「理由不明」があり、ここが唯一の受け皿になる。
+ * 理由が空欄の行はそもそも離脱していないため、受け皿へは入れない。
+ */
+const AGG_LEAVING_UNKNOWN_LABELS = [AGG_OTHER_LABEL, '理由不明', '不明'];
+
 /** 一覧シートで集計可能な正規化済みランク */
 const AGG_ALLOWED_RANKS = ['A', 'B-A', 'B-B', 'B-C', 'B-D', 'C', 'D'];
 
@@ -953,7 +969,7 @@ function _buildAggregationPlan(grid, listData, targetYear, style, preflight) {
     pushRequired(_buildIncomeAgeWrites(selected.all, selected.closed), '年収×年齢');
     pushRequired(_buildAgeFamilyWrites(selected.all, selected.closed), '家族数×年齢');
     pushRequired(_buildAttrIndustryWrites(selected.all, selected.closed), '属性×業界');
-    pushRequired(_buildNeedsWrites(selected.all), '問い合わせニーズ');
+    pushRequired(_buildNeedsWrites(grid, selected.all), '問い合わせニーズ');
     pushRequired(_buildConsiderationWrite(selected.all), '検討レベル');
     pushRequired(_buildLeavingWrite(grid, selected.all), '離脱理由');
     pushOptional(_buildYearLabelWrites(grid, targetYear, AGG_RESIDENTIAL_ROWS.YEAR_LABEL_CELLS));
@@ -1219,9 +1235,11 @@ function _validateAggregationPreflight(grid, listData, targetYear, style) {
 /**
  * ラベル別集計で一覧行が黙って欠落しないことを、書き込み前に検証する。
  *
- * 方針（2026-07-28 決定）: 語彙に無い値は集計を止めず「不明」へ寄せ、
- * 何件をどの区分へ寄せたかを警告ログへ残す。受け皿ラベルが1つも無く、
- * 寄せ先が存在しないブロックだけは、黙って欠落させず失敗させる。
+ * 方針（2026-07-28 決定）: 語彙に無い値は集計を止めず受け皿区分へ寄せる。
+ * ランクは成約（A）判定にしか使わず反響数は全行を数えるため、語彙外ランクは
+ * 「成約以外」として扱えば欠落しない。検討レベルは「未」へ寄せる。
+ * 受け皿ラベルが1つも無く寄せ先が存在しないブロックだけは、黙って欠落
+ * させず失敗させる。
  *
  * @param {Array<Array<*>>} grid
  * @param {Map<string, Array<Array<*>>>} rowsByYear
@@ -1236,41 +1254,34 @@ function _validateAggregationInputCoverage(grid, rowsByYear, style) {
     row => _cellText(row[SALES_LIST_COLS.RANK - 1]) === 'A'
   );
 
-  // ランクは成約（A）判定にしか使わず、反響数は全行を数える。
-  // 語彙外ランクは「成約ではない」として扱えばよく、欠落は起きない。
-  const invalidRankValues = _distinctCellValues(
-    allRows, SALES_LIST_COLS.RANK, value => !AGG_ALLOWED_RANKS.includes(value)
-  );
-  if (invalidRankValues.length > 0) {
-    AppLogger.warn('集計可能なランクではない一覧行を「成約以外」として集計します', {
-      values: invalidRankValues,
-    });
-  }
-
   const labeledSections = [
     {
       label: '反響媒体（全体）',
       headerRow: AGG_ROWS.MEDIA_ALL_HEADER,
       rows: allRows,
       resolver: _mediaKeyResolver,
+      fallbackLabels: AGG_UNKNOWN_LABELS,
     },
     {
       label: '反響媒体（成約）',
       headerRow: AGG_ROWS.MEDIA_CLOSED_HEADER,
       rows: closedRows,
       resolver: _mediaKeyResolver,
+      fallbackLabels: AGG_UNKNOWN_LABELS,
     },
     {
       label: 'エリア（全体）',
       headerRow: AGG_ROWS.AREA_ALL_HEADER,
       rows: allRows,
       resolver: _areaKeyResolver,
+      fallbackLabels: AGG_AREA_UNKNOWN_LABELS,
     },
     {
       label: 'エリア（成約）',
       headerRow: AGG_ROWS.AREA_CLOSED_HEADER,
       rows: closedRows,
       resolver: _areaKeyResolver,
+      fallbackLabels: AGG_AREA_UNKNOWN_LABELS,
     },
   ];
 
@@ -1281,97 +1292,31 @@ function _validateAggregationInputCoverage(grid, rowsByYear, style) {
     const unresolved = section.rows.filter(
       row => section.resolver(row, labels) === -1
     ).length;
-    if (unresolved === 0) continue;
-
-    // resolver は受け皿があれば必ずそこへ寄せるため、未解決＝受け皿行が無い。
-    throw new Error(
-      `${section.label}に「${AGG_UNKNOWN_LABELS.join('」「')}」行がなく、` +
-      `分類できない一覧行を集計できません: ${unresolved}件`
-    );
-  }
-
-  const staff = _scanHeaderLabels(grid, AGG_ROWS.STAFF_HEADER, 1);
-  const staffOtherLabel = AGG_UNKNOWN_LABELS.find(
-    label => staff.labels.includes(label)
-  );
-  const unresolvedStaff = _distinctCellValues(
-    allRows, SALES_LIST_COLS.MANAGER, value => !staff.labels.includes(value)
-  );
-  if (unresolvedStaff.length > 0) {
-    // 担当者別は合計列が反響数と一致すべきブロック。受け皿列が無いと差が出る。
-    if (!staffOtherLabel) {
+    if (unresolved > 0) {
+      // resolver は受け皿があれば必ずそこへ寄せるため、未解決＝受け皿行が無い。
       throw new Error(
-        `担当者別に「${AGG_UNKNOWN_LABELS.join('」「')}」列がなく、` +
-        `分類できない一覧行があります: ${unresolvedStaff.length}件`
+        `${section.label}に「${section.fallbackLabels.join('」「')}」行がなく、` +
+        `分類できない一覧行を集計できません: ${unresolved}件`
       );
     }
-    AppLogger.warn(`担当者別で未登録の担当者を「${staffOtherLabel}」列へ集計します`, {
-      values: unresolvedStaff,
-    });
   }
 
-  if (style !== 'residential') return;
-
-  const unknownConsideration = _distinctCellValues(
-    allRows,
-    SALES_LIST_COLS.LIKEHOOD,
-    value => AGG_CONSIDERATION_MAP[value] === undefined
+  // 担当者別は合計列が反響数と一致すべきブロック。受け皿列が無いと差が出る。
+  const staff = _scanHeaderLabels(grid, AGG_ROWS.STAFF_HEADER, 1);
+  const hasStaffFallback = AGG_UNKNOWN_LABELS.some(
+    label => staff.labels.includes(label)
   );
-  if (unknownConsideration.length > 0) {
-    AppLogger.warn('検討レベルに分類できない見込度を「未」へ集計します', {
-      values: unknownConsideration,
-    });
-  }
-
-  // 問い合わせニーズ・離脱理由は列/行が固定ラベルで受け皿が無く、合計もその
-  // ブロック内で閉じている。対象外の値は計上しない旨を残して先へ進める。
-  for (const block of AGG_RESIDENTIAL_ROWS.NEEDS_BLOCKS) {
-    const unresolvedNeeds = _distinctCellValues(
-      allRows.filter(row => _hasValue(row[block.filterCol - 1])),
-      CUSTOMER_LIST_COLS.FIRST_APPOINT,
-      value => !AGG_NEEDS_APPOINTS.includes(value)
-    );
-    if (unresolvedNeeds.length > 0) {
-      AppLogger.warn('問い合わせニーズの対象外アポイント種別を計上しません', {
-        startRow: block.startRow,
-        values: unresolvedNeeds,
-      });
+  if (!hasStaffFallback) {
+    const unresolvedStaff = allRows.filter(
+      row => !staff.labels.includes(_cellText(row[SALES_LIST_COLS.MANAGER - 1]))
+    ).length;
+    if (unresolvedStaff > 0) {
+      throw new Error(
+        `担当者別に「${AGG_UNKNOWN_LABELS.join('」「')}」列がなく、` +
+        `分類できない一覧行があります: ${unresolvedStaff}件`
+      );
     }
   }
-
-  const { labels: leavingReasons } = _scanLabels(
-    grid,
-    AGG_RESIDENTIAL_ROWS.LEAVING_START,
-    11,
-    30
-  );
-  const unresolvedReasons = _distinctCellValues(
-    allRows,
-    RESIDENTIAL_EXTRA_COLS.REASON,
-    value => value !== '' && !leavingReasons.includes(value)
-  );
-  if (unresolvedReasons.length > 0) {
-    AppLogger.warn('離脱理由に無い値を計上しません', { values: unresolvedReasons });
-  }
-}
-
-/**
- * 指定列のうち条件に合致する値を、重複なく最大10件まで返す（警告ログ用）。
- * @param {Array<Array<*>>} rows
- * @param {number} col 1始まりの列番号
- * @param {function(string): boolean} predicate
- * @returns {string[]}
- */
-function _distinctCellValues(rows, col, predicate) {
-  const seen = new Set();
-  for (const row of rows) {
-    const value = _cellText(row[col - 1]);
-    if (predicate(value) && !seen.has(value)) {
-      seen.add(value);
-      if (seen.size >= 10) break;
-    }
-  }
-  return [...seen].map(value => (value === '' ? '(空)' : value));
 }
 
 /**
@@ -1684,17 +1629,36 @@ function _buildStaffWrites(grid, yearData) {
  * @returns {number} ラベルインデックス（-1 なら対象外）
  */
 function _mediaKeyResolver(row, labels) {
-  const idx = labels.indexOf(_cellText(row[CUSTOMER_LIST_COLS.INFO_ROUTE - 1]));
-  return idx !== -1 ? idx : _findUnknownLabelIndex(labels);
+  const idx = _findLabelIndexIgnoreCase(
+    labels, _cellText(row[CUSTOMER_LIST_COLS.INFO_ROUTE - 1])
+  );
+  return idx !== -1 ? idx : _findUnknownLabelIndex(labels, AGG_UNKNOWN_LABELS);
 }
 
 /**
- * ラベル一覧から「その他」「不明」受け皿のインデックスを返す（無ければ -1）
+ * ラベルを検索する。完全一致を優先し、無ければ大文字小文字を無視して照合する。
+ * 反響媒体は同じ媒体がシート内で「Instagram」「instagram」と揺れており、
+ * 完全一致だけだと成約者ブロックで「その他」へ落ちるため。
  * @param {string[]} labels
+ * @param {string} value
+ * @returns {number} 見つからなければ -1
+ */
+function _findLabelIndexIgnoreCase(labels, value) {
+  if (value === '') return -1;
+  const exact = labels.indexOf(value);
+  if (exact !== -1) return exact;
+  const lowered = value.toLowerCase();
+  return labels.findIndex(label => label.toLowerCase() === lowered);
+}
+
+/**
+ * ラベル一覧から受け皿ラベルのインデックスを返す（無ければ -1）
+ * @param {string[]} labels
+ * @param {string[]} fallbackLabels 受け皿候補（優先順）
  * @returns {number}
  */
-function _findUnknownLabelIndex(labels) {
-  for (const label of AGG_UNKNOWN_LABELS) {
+function _findUnknownLabelIndex(labels, fallbackLabels) {
+  for (const label of fallbackLabels) {
     const idx = labels.indexOf(label);
     if (idx !== -1) return idx;
   }
@@ -1718,7 +1682,7 @@ function _areaKeyResolver(row, labels) {
     const idx = labels.indexOf(pref);
     if (idx !== -1) return idx;
   }
-  return _findUnknownLabelIndex(labels);
+  return _findUnknownLabelIndex(labels, AGG_AREA_UNKNOWN_LABELS);
 }
 
 /**
@@ -1880,25 +1844,33 @@ function _buildAttrIndustryWrites(yearData, closedData) {
 // ⑥ 住宅系 問い合わせニーズ（一次取得/持家/実家など）
 // ============================================================
 
-/** 問い合わせ種別のシート列順（B〜F） */
-const AGG_NEEDS_APPOINTS = ['相談会', '個別相談', '外部相談会', '見学会', '資料請求'];
-
 /**
  * 問い合わせニーズ3ブロックの書き込み指示を作る
  * 各ブロック: 反響/来場/契約/来場率/歩留 の5行 × （種別5列＋計）
  * @param {Array<Array<*>>} yearData
  * @returns {Array<{ row: number, col: number, values: Array<Array<*>> }>}
  */
-function _buildNeedsWrites(yearData) {
+function _buildNeedsWrites(grid, yearData) {
   return AGG_RESIDENTIAL_ROWS.NEEDS_BLOCKS.map((block) => {
-    const n = AGG_NEEDS_APPOINTS.length;
+    // 列はヘッダー行（B〜'計'）から動的に読む。「その他」列を足せば、
+    // 5種別に無い初回アポイントもコード変更なしでそこへ集計される。
+    const { labels, hasTotal } = _scanHeaderLabels(grid, block.startRow - 1, 1);
+    if (labels.length === 0 || !hasTotal) {
+      throw new Error(
+        `問い合わせニーズの必須ヘッダーまたは合計列が見つかりません: ${block.startRow - 1}行`
+      );
+    }
+
+    const n = labels.length;
+    const fallbackIndex = _findUnknownLabelIndex(labels, AGG_UNKNOWN_LABELS);
     const res = new Array(n + 1).fill(0);
     const vis = new Array(n + 1).fill(0);
     const close = new Array(n + 1).fill(0);
 
     for (const row of yearData) {
       if (!_hasValue(row[block.filterCol - 1])) continue;  // 対象ニーズの顧客のみ
-      const idx = AGG_NEEDS_APPOINTS.indexOf(_cellText(row[CUSTOMER_LIST_COLS.FIRST_APPOINT - 1]));
+      const matched = labels.indexOf(_cellText(row[CUSTOMER_LIST_COLS.FIRST_APPOINT - 1]));
+      const idx = matched !== -1 ? matched : fallbackIndex;
       if (idx === -1) continue;
       for (const i of [idx, n]) {
         res[i]++;
@@ -1955,9 +1927,13 @@ function _buildLeavingWrite(grid, yearData) {
 
   // rows: 理由ごと + 合計行 / cols: 理由総数 + 担当者ごと
   const matrix = Array.from({ length: reasons.length + 1 }, () => new Array(staffList.length + 1).fill(0));
+  const unknownReasonIndex = _findUnknownLabelIndex(reasons, AGG_LEAVING_UNKNOWN_LABELS);
   for (const row of yearData) {
     const reason = _cellText(row[RESIDENTIAL_EXTRA_COLS.REASON - 1]);
-    const r = reasons.indexOf(reason);
+    // 理由が空＝まだ離脱していない行。ここで数えると離脱数が水増しされる。
+    if (reason === '') continue;
+    const matched = reasons.indexOf(reason);
+    const r = matched !== -1 ? matched : unknownReasonIndex;
     if (r === -1) continue;
     const staff = _cellText(row[SALES_LIST_COLS.MANAGER - 1]);
     const s = staffList.indexOf(staff);
@@ -2104,12 +2080,15 @@ function _buildEventWrite(grid, yearData) {
     throw new Error('集客イベントの必須ヘッダーまたは合計列が見つかりません');
   }
   const n = items.length;
+  // ヘッダーに「その他」列を足せば、5種別に無い初回アポイントもそこへ集計される。
+  const fallbackIndex = _findUnknownLabelIndex(items, AGG_UNKNOWN_LABELS);
   const res = new Array(n + 1).fill(0);
   const vis = new Array(n + 1).fill(0);
   const close = new Array(n + 1).fill(0);
 
   for (const row of yearData) {
-    const idx = items.indexOf(_cellText(row[CUSTOMER_LIST_COLS.FIRST_APPOINT - 1]));
+    const matched = items.indexOf(_cellText(row[CUSTOMER_LIST_COLS.FIRST_APPOINT - 1]));
+    const idx = matched !== -1 ? matched : fallbackIndex;
     if (idx === -1) continue;
     for (const i of [idx, n]) {
       res[i]++;
