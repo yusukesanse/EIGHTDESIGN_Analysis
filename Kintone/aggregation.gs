@@ -23,26 +23,11 @@
 
 // ============================================================
 // 対象ドメイン定義
+// ------------------------------------------------------------
+// AGG_AREAS / AGG_DOMAINS は config.gs 側に置く。GAS は .gs をファイル名順に
+// 評価するため（aggregation は config より先）、ここで AREAS / CUSTOMER_TYPES を
+// トップレベル参照すると "Cannot access 'AREAS' before initialization" になる。
 // ============================================================
-
-/** 集計対象エリア */
-const AGG_AREAS = [AREAS.NAGOYA, AREAS.TOKYO];
-
-/**
- * 集計対象ドメインとレイアウト種別
- * style: 'residential'（一般住宅・新築） / 'business'（法人系）
- */
-const AGG_DOMAINS = [
-  { type: CUSTOMER_TYPES.RESIDENTIAL, style: 'residential' },
-  { type: CUSTOMER_TYPES.NEW_BUILD,   style: 'residential' },
-  { type: CUSTOMER_TYPES.SMALL_STORE, style: 'business' },
-  { type: CUSTOMER_TYPES.OFFICE,      style: 'business' },
-  { type: CUSTOMER_TYPES.TRAILER,     style: 'business' },
-  { type: CUSTOMER_TYPES.MEDICAL,     style: 'business' },
-  { type: CUSTOMER_TYPES.FACTORY,     style: 'business' },
-  { type: CUSTOMER_TYPES.RENTAL,      style: 'business' },
-  { type: CUSTOMER_TYPES.MISEIE,      style: 'business' },
-];
 
 /**
  * ドメインシート名を組み立てる
@@ -2006,12 +1991,8 @@ function _buildCrossMatrixWrites(grid, yearData, closedData, headerRow, rowValue
 // ⑩ 法人系 業態×業種（反響者/契約者）
 // ============================================================
 
-/** 業態フラグ列（希望種別A/B/C）→ 業態列インデックス */
-const AGG_TYPE_NEEDS_FLAG_COLS = [
-  { col: BUSINESS_EXTRA_COLS.HOPE_TYPE_A, idx: 0 },  // 独立・入居希望
-  { col: BUSINESS_EXTRA_COLS.HOPE_TYPE_B, idx: 1 },  // 既存店舗・大家
-  { col: BUSINESS_EXTRA_COLS.HOPE_TYPE_C, idx: 2 },  // 新店舗・移転
-];
+// AGG_TYPE_NEEDS_FLAG_COLS は BUSINESS_EXTRA_COLS を参照するため config.gs 側に置く
+// （GAS のファイル名順評価では config.gs がこのファイルより後になる）。
 
 /**
  * 業態×業種の書き込み指示を作る

@@ -288,3 +288,38 @@ const LIST_COL_INDEX = {
   RANK:          2,   // C列 = インデックス2
   CUSTOMER_NAME: 5,   // F列 = インデックス5
 };
+
+// ============================================================
+// 集計対象ドメイン（aggregation.gs / sheets.gs / reconciliation.gs が参照）
+// ------------------------------------------------------------
+// GAS は .gs をファイル名順に評価するため、aggregation.gs は config.gs より
+// 先に読み込まれる。これらは AREAS / CUSTOMER_TYPES / BUSINESS_EXTRA_COLS を
+// トップレベルで参照するので、依存元と同じこのファイルの、依存より後ろに置く。
+// aggregation.gs 側へ戻すと "Cannot access 'AREAS' before initialization" になる。
+// ============================================================
+
+/** 集計対象エリア */
+const AGG_AREAS = [AREAS.NAGOYA, AREAS.TOKYO];
+
+/**
+ * 集計対象ドメインとレイアウト種別
+ * style: 'residential'（一般住宅・新築） / 'business'（法人系）
+ */
+const AGG_DOMAINS = [
+  { type: CUSTOMER_TYPES.RESIDENTIAL, style: 'residential' },
+  { type: CUSTOMER_TYPES.NEW_BUILD,   style: 'residential' },
+  { type: CUSTOMER_TYPES.SMALL_STORE, style: 'business' },
+  { type: CUSTOMER_TYPES.OFFICE,      style: 'business' },
+  { type: CUSTOMER_TYPES.TRAILER,     style: 'business' },
+  { type: CUSTOMER_TYPES.MEDICAL,     style: 'business' },
+  { type: CUSTOMER_TYPES.FACTORY,     style: 'business' },
+  { type: CUSTOMER_TYPES.RENTAL,      style: 'business' },
+  { type: CUSTOMER_TYPES.MISEIE,      style: 'business' },
+];
+
+/** 業態フラグ列（希望種別A/B/C）→ 業態列インデックス */
+const AGG_TYPE_NEEDS_FLAG_COLS = [
+  { col: BUSINESS_EXTRA_COLS.HOPE_TYPE_A, idx: 0 },  // 独立・入居希望
+  { col: BUSINESS_EXTRA_COLS.HOPE_TYPE_B, idx: 1 },  // 既存店舗・大家
+  { col: BUSINESS_EXTRA_COLS.HOPE_TYPE_C, idx: 2 },  // 新店舗・移転
+];

@@ -23,6 +23,7 @@ node --test 'tests/**/*.test.mjs'
 | ファイル | 対象 |
 |---|---|
 | `harness/loadGas.mjs` | `.gs` 群をホストレルム上で評価し関数・定数を公開するローダ＋フェイクシート |
+| `characterization/loadOrder.test.mjs` | GAS実機と同じファイル名順・逆順で評価しても読み込めること（トップレベル`const`のロード順依存の検出） |
 | `characterization/transforms.test.mjs` | 日付変換・正規化・ランク/年収/イベント変換・担当者・商談履歴パーサ |
 | `characterization/validation.test.mjs` | Webhook 検証（正常/JSON不正/app.id欠如/record欠如/未対応appId/必須不足） |
 | `characterization/normalizedRecord.test.mjs` | 正規化済みモデル `buildNormalizedRecord` |
