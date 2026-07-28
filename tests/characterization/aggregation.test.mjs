@@ -275,17 +275,42 @@ test('住宅系: 不正な月は月別合計から黙って落とさず書込前
   );
 });
 
-test('住宅系: 未定義ランクは成約判定から黙って落とさず書込前に失敗する', () => {
+// 旧挙動: 未定義ランクは書込前に失敗させていた。
+// 新挙動（2026-07-28）: ランクは成約(A)判定にしか使わず反響数は全行数えるため、
+// 語彙外ランクは「成約以外」として集計を続行する（警告ログのみ）。
+// 顧客情報アプリの likehood_now に RANK_MAP 未定義の値が実在し、
+// 一覧だけ書けて集計が反映されない状態を作っていたため。
+test('住宅系: 未定義ランクは「成約以外」として集計を続行する', () => {
   const grid = makeResidentialGrid();
-  assert.throws(
-    () => g.buildAggregationWrites(
-      grid,
-      [makeListRow({ rank: '未知ランク' })],
-      '2026年',
-      'residential',
-    ),
-    /集計可能なランクではない/
+  const writes = g.buildAggregationWrites(
+    grid,
+    [makeListRow({ rank: '未知ランク' })],
+    '2026年',
+    'residential',
   );
+
+  const funnel = findWrite(writes, 35, 3);
+  assert.ok(funnel);
+  assert.strictEqual(funnel.values[0][0], 1, '反響者には数える');
+  assert.strictEqual(funnel.values[4][0], 0, '成約には数えない');
+});
+
+// 旧挙動: 検討レベルに無い見込度は書込前に失敗させていた。
+// 新挙動（2026-07-28）: 「未」区分へ寄せ、検討レベル合計を反響数と一致させる。
+test('住宅系: 検討レベルに無い見込度は「未」へ寄せて合計を反響数と一致させる', () => {
+  const grid = makeResidentialGrid();
+  const writes = g.buildAggregationWrites(
+    grid,
+    [makeListRow({ likehood: '面識なし' })],
+    '2026年',
+    'residential',
+  );
+
+  const consideration = writes.find((w) => w.col === 13 && w.values.length === 1);
+  assert.ok(consideration, '検討レベルの書き込み指示がある');
+  const counts = consideration.values[0];
+  assert.strictEqual(counts[4], 1, '「未」区分へ寄せる');
+  assert.strictEqual(counts.at(-1), 1, '合計は反響数と一致');
 });
 
 test('住宅系: 担当者別はヘッダーの担当者順+その他+合計で書く', () => {
@@ -434,6 +459,9 @@ test('法人系: 業種×企業規模は不明フォールバック込みで反�
   assert.deepStrictEqual(closed.values[0], [1, 0, 0, 1], '契約者はランクAのみ');
 });
 
+// 新挙動（2026-07-28）でも「受け皿が無ければ失敗」は維持する。
+// 媒体別・エリア別は合計が反響数と一致すべきブロックのため、寄せ先が無いまま
+// 続行すると合計が黙って減る。メッセージは受け皿追加を促す内容へ変更。
 test('法人系: 受け皿の無い未知媒体は合計から黙って落とさず失敗する', () => {
   const grid = makeBusinessGrid();
   assert.throws(
@@ -443,7 +471,7 @@ test('法人系: 受け皿の無い未知媒体は合計から黙って落とさ
       '2026年',
       'business',
     ),
-    /反響媒体（全体）で分類できない/
+    /反響媒体（全体）に「その他」「不明」行がなく/
   );
 });
 

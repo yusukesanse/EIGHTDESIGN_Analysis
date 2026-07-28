@@ -6,6 +6,7 @@ function customersTest() {
     "id": "20",
     "name": "顧客情報"
   },
+  "type": "UPDATE_RECORD",
   "record": {
     "first_appoint": {
       "type": "DROP_DOWN",
@@ -135,7 +136,7 @@ function customersTest() {
     },
     "inquiry_date": {
       "type": "DATE",
-      "value": "2026-7-28"
+      "value": "2026-07-28"
     },
     "$id": {
       "type": "__ID__",

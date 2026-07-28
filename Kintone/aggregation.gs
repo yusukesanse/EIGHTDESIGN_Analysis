@@ -191,8 +191,19 @@ const AGG_TOTAL_LABELS = ['計', '合計'];
 /** その他（受け皿）ラベル */
 const AGG_OTHER_LABEL = 'その他';
 
+/**
+ * 分類できない値の受け皿として使えるラベル（優先順）。
+ * 方針（2026-07-28 決定）: 語彙に無い値は集計を止めず「不明」へ寄せる。
+ * ただし受け皿行/列がシートに1つも無い場合だけは、合計が反響数と食い違う
+ * ため黙って落とさずエラーにする。
+ */
+const AGG_UNKNOWN_LABELS = [AGG_OTHER_LABEL, '不明'];
+
 /** 一覧シートで集計可能な正規化済みランク */
 const AGG_ALLOWED_RANKS = ['A', 'B-A', 'B-B', 'B-C', 'B-D', 'C', 'D'];
+
+/** 検討レベルで分類できない見込度を寄せる区分（「未」＝不明と同じ列） */
+const AGG_CONSIDERATION_UNKNOWN_INDEX = 4;
 
 /** 対象年度セルの書式（例: 2026年） */
 const AGG_YEAR_PATTERN = /^20\d{2}年$/;
@@ -1207,7 +1218,11 @@ function _validateAggregationPreflight(grid, listData, targetYear, style) {
 
 /**
  * ラベル別集計で一覧行が黙って欠落しないことを、書き込み前に検証する。
- * 「その他」列/行がある場合はそこへ集約し、受け皿が無い場合は明示的に失敗する。
+ *
+ * 方針（2026-07-28 決定）: 語彙に無い値は集計を止めず「不明」へ寄せ、
+ * 何件をどの区分へ寄せたかを警告ログへ残す。受け皿ラベルが1つも無く、
+ * 寄せ先が存在しないブロックだけは、黙って欠落させず失敗させる。
+ *
  * @param {Array<Array<*>>} grid
  * @param {Map<string, Array<Array<*>>>} rowsByYear
  * @param {string} style
@@ -1220,11 +1235,16 @@ function _validateAggregationInputCoverage(grid, rowsByYear, style) {
   const closedRows = allRows.filter(
     row => _cellText(row[SALES_LIST_COLS.RANK - 1]) === 'A'
   );
-  const invalidRanks = allRows.filter(row =>
-    !AGG_ALLOWED_RANKS.includes(_cellText(row[SALES_LIST_COLS.RANK - 1]))
-  ).length;
-  if (invalidRanks > 0) {
-    throw new Error(`集計可能なランクではない一覧行があります: ${invalidRanks}件`);
+
+  // ランクは成約（A）判定にしか使わず、反響数は全行を数える。
+  // 語彙外ランクは「成約ではない」として扱えばよく、欠落は起きない。
+  const invalidRankValues = _distinctCellValues(
+    allRows, SALES_LIST_COLS.RANK, value => !AGG_ALLOWED_RANKS.includes(value)
+  );
+  if (invalidRankValues.length > 0) {
+    AppLogger.warn('集計可能なランクではない一覧行を「成約以外」として集計します', {
+      values: invalidRankValues,
+    });
   }
 
   const labeledSections = [
@@ -1254,53 +1274,68 @@ function _validateAggregationInputCoverage(grid, rowsByYear, style) {
     },
   ];
 
+  // 媒体別・エリア別は合計行が反響数と一致すべきブロック。受け皿ラベルがあれば
+  // そこへ寄せ、1つも無い場合だけ「黙って落ちる」のを避けて失敗させる。
   for (const section of labeledSections) {
     const { labels } = _scanLabels(grid, section.headerRow + 1, 0, 120);
     const unresolved = section.rows.filter(
       row => section.resolver(row, labels) === -1
     ).length;
-    if (unresolved > 0) {
-      throw new Error(
-        `${section.label}で分類できない一覧行があります: ${unresolved}件`
-      );
-    }
+    if (unresolved === 0) continue;
+
+    // resolver は受け皿があれば必ずそこへ寄せるため、未解決＝受け皿行が無い。
+    throw new Error(
+      `${section.label}に「${AGG_UNKNOWN_LABELS.join('」「')}」行がなく、` +
+      `分類できない一覧行を集計できません: ${unresolved}件`
+    );
   }
 
   const staff = _scanHeaderLabels(grid, AGG_ROWS.STAFF_HEADER, 1);
-  if (!staff.labels.includes(AGG_OTHER_LABEL)) {
-    const unresolvedStaff = allRows.filter(row =>
-      !staff.labels.includes(_cellText(row[SALES_LIST_COLS.MANAGER - 1]))
-    ).length;
-    if (unresolvedStaff > 0) {
+  const staffOtherLabel = AGG_UNKNOWN_LABELS.find(
+    label => staff.labels.includes(label)
+  );
+  const unresolvedStaff = _distinctCellValues(
+    allRows, SALES_LIST_COLS.MANAGER, value => !staff.labels.includes(value)
+  );
+  if (unresolvedStaff.length > 0) {
+    // 担当者別は合計列が反響数と一致すべきブロック。受け皿列が無いと差が出る。
+    if (!staffOtherLabel) {
       throw new Error(
-        `担当者別に「${AGG_OTHER_LABEL}」列がなく、分類できない一覧行があります: ` +
-        `${unresolvedStaff}件`
+        `担当者別に「${AGG_UNKNOWN_LABELS.join('」「')}」列がなく、` +
+        `分類できない一覧行があります: ${unresolvedStaff.length}件`
       );
     }
+    AppLogger.warn(`担当者別で未登録の担当者を「${staffOtherLabel}」列へ集計します`, {
+      values: unresolvedStaff,
+    });
   }
 
   if (style !== 'residential') return;
 
-  const unknownConsideration = allRows.filter(row =>
-    AGG_CONSIDERATION_MAP[_cellText(row[SALES_LIST_COLS.LIKEHOOD - 1])] === undefined
-  ).length;
-  if (unknownConsideration > 0) {
-    throw new Error(
-      `検討レベルに分類できない一覧行があります: ${unknownConsideration}件`
-    );
+  const unknownConsideration = _distinctCellValues(
+    allRows,
+    SALES_LIST_COLS.LIKEHOOD,
+    value => AGG_CONSIDERATION_MAP[value] === undefined
+  );
+  if (unknownConsideration.length > 0) {
+    AppLogger.warn('検討レベルに分類できない見込度を「未」へ集計します', {
+      values: unknownConsideration,
+    });
   }
 
+  // 問い合わせニーズ・離脱理由は列/行が固定ラベルで受け皿が無く、合計もその
+  // ブロック内で閉じている。対象外の値は計上しない旨を残して先へ進める。
   for (const block of AGG_RESIDENTIAL_ROWS.NEEDS_BLOCKS) {
-    const unresolvedNeeds = allRows.filter(row =>
-      _hasValue(row[block.filterCol - 1]) &&
-      !AGG_NEEDS_APPOINTS.includes(
-        _cellText(row[CUSTOMER_LIST_COLS.FIRST_APPOINT - 1])
-      )
-    ).length;
-    if (unresolvedNeeds > 0) {
-      throw new Error(
-        `問い合わせニーズに分類できない一覧行があります: ${unresolvedNeeds}件`
-      );
+    const unresolvedNeeds = _distinctCellValues(
+      allRows.filter(row => _hasValue(row[block.filterCol - 1])),
+      CUSTOMER_LIST_COLS.FIRST_APPOINT,
+      value => !AGG_NEEDS_APPOINTS.includes(value)
+    );
+    if (unresolvedNeeds.length > 0) {
+      AppLogger.warn('問い合わせニーズの対象外アポイント種別を計上しません', {
+        startRow: block.startRow,
+        values: unresolvedNeeds,
+      });
     }
   }
 
@@ -1310,15 +1345,33 @@ function _validateAggregationInputCoverage(grid, rowsByYear, style) {
     11,
     30
   );
-  const unresolvedReasons = allRows.filter(row => {
-    const reason = _cellText(row[RESIDENTIAL_EXTRA_COLS.REASON - 1]);
-    return reason !== '' && !leavingReasons.includes(reason);
-  }).length;
-  if (unresolvedReasons > 0) {
-    throw new Error(
-      `離脱理由に分類できない一覧行があります: ${unresolvedReasons}件`
-    );
+  const unresolvedReasons = _distinctCellValues(
+    allRows,
+    RESIDENTIAL_EXTRA_COLS.REASON,
+    value => value !== '' && !leavingReasons.includes(value)
+  );
+  if (unresolvedReasons.length > 0) {
+    AppLogger.warn('離脱理由に無い値を計上しません', { values: unresolvedReasons });
   }
+}
+
+/**
+ * 指定列のうち条件に合致する値を、重複なく最大10件まで返す（警告ログ用）。
+ * @param {Array<Array<*>>} rows
+ * @param {number} col 1始まりの列番号
+ * @param {function(string): boolean} predicate
+ * @returns {string[]}
+ */
+function _distinctCellValues(rows, col, predicate) {
+  const seen = new Set();
+  for (const row of rows) {
+    const value = _cellText(row[col - 1]);
+    if (predicate(value) && !seen.has(value)) {
+      seen.add(value);
+      if (seen.size >= 10) break;
+    }
+  }
+  return [...seen].map(value => (value === '' ? '(空)' : value));
 }
 
 /**
@@ -1575,7 +1628,11 @@ function _buildStaffWrites(grid, yearData) {
       hasTotal = true;
       break;
     }
-    columns.push(label === AGG_OTHER_LABEL ? { kind: 'other' } : { kind: 'staff', name: label });
+    columns.push(
+      AGG_UNKNOWN_LABELS.includes(label)
+        ? { kind: 'other' }
+        : { kind: 'staff', name: label }
+    );
   }
   if (columns.length === 0 || !hasTotal) {
     throw new Error('担当者別の必須ヘッダーまたは合計列が見つかりません');
@@ -1628,7 +1685,20 @@ function _buildStaffWrites(grid, yearData) {
  */
 function _mediaKeyResolver(row, labels) {
   const idx = labels.indexOf(_cellText(row[CUSTOMER_LIST_COLS.INFO_ROUTE - 1]));
-  return idx !== -1 ? idx : labels.indexOf(AGG_OTHER_LABEL);
+  return idx !== -1 ? idx : _findUnknownLabelIndex(labels);
+}
+
+/**
+ * ラベル一覧から「その他」「不明」受け皿のインデックスを返す（無ければ -1）
+ * @param {string[]} labels
+ * @returns {number}
+ */
+function _findUnknownLabelIndex(labels) {
+  for (const label of AGG_UNKNOWN_LABELS) {
+    const idx = labels.indexOf(label);
+    if (idx !== -1) return idx;
+  }
+  return -1;
 }
 
 /**
@@ -1648,7 +1718,7 @@ function _areaKeyResolver(row, labels) {
     const idx = labels.indexOf(pref);
     if (idx !== -1) return idx;
   }
-  return labels.indexOf(AGG_OTHER_LABEL);
+  return _findUnknownLabelIndex(labels);
 }
 
 /**
@@ -1855,8 +1925,9 @@ function _buildNeedsWrites(yearData) {
 function _buildConsiderationWrite(yearData) {
   const counts = new Array(AGG_CONSIDERATION_COUNT + 1).fill(0);
   for (const row of yearData) {
-    const idx = AGG_CONSIDERATION_MAP[_cellText(row[SALES_LIST_COLS.LIKEHOOD - 1])];
-    if (idx === undefined) continue;
+    // 語彙に無い見込度は落とさず「未」（不明）へ寄せ、合計を反響数と一致させる。
+    const idx = AGG_CONSIDERATION_MAP[_cellText(row[SALES_LIST_COLS.LIKEHOOD - 1])]
+      ?? AGG_CONSIDERATION_UNKNOWN_INDEX;
     counts[idx]++;
     counts[AGG_CONSIDERATION_COUNT]++;
   }

@@ -6,6 +6,7 @@ function doPostTest2() {
     "id": "27",
     "name": "営業・商談管理"
   },
+  "type": "UPDATE_RECORD",
   "record": {
     "reason": {
       "type": "DROP_DOWN",
@@ -496,7 +497,7 @@ function doPostTest2() {
     },
     "inquiry_date": {
       "type": "DATE",
-      "value": "2026-7-28"
+      "value": "2026-07-28"
     },
     "company_size": {
       "type": "DROP_DOWN",
