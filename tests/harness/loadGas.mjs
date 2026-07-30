@@ -35,6 +35,15 @@ export const CORE_FILES = [
   'Kintone/main.gs',         // エントリ・Webhook制御・振り分け
 ];
 
+/**
+ * GASエディタから手で動かす確認用スクリプト。
+ * 本番経路には呼ばれないので CORE_FILES とは分け、必要なテストだけが
+ * `loadGas({ files: [...CORE_FILES, ...MANUAL_RUNNER_FILES] })` で読み込む。
+ */
+export const MANUAL_RUNNER_FILES = [
+  '全18枚集計テスト.gs',      // 18枚の点検（書き込みなし）と全面再計算
+];
+
 /** テストから参照できるよう globalThis へ公開するシンボル名 */
 const EXPOSED = [
   // 定数
@@ -79,6 +88,8 @@ const EXPOSED = [
   'RECON_DIFF_TYPES', 'RECON_DIFF_HEADERS', 'RECON_PAGE_SIZE',
   'runKintoneReconciliationDryRun', 'dryRunKintoneReconciliation',
   'computeKintoneListDiffs', '_reconFetchAllRecords',
+  // 手動確認スクリプト（MANUAL_RUNNER_FILES を読み込んだときだけ定義される）
+  'test18_check', 'test18_run',
 ];
 
 /**

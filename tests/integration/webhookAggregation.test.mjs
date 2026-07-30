@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadGas } from '../harness/loadGas.mjs';
+import { loadGas, CORE_FILES, MANUAL_RUNNER_FILES } from '../harness/loadGas.mjs';
 import {
   StatefulSheet,
   StatefulSpreadsheet,
@@ -394,7 +394,7 @@ test('Webhook統合: DELETE_RECORDは一覧を変更せずFAILEDにする', () =
   assert.equal(ledger.valueAt(ledger.getLastRow(), stageCol), 'IDENTITY_CHECK');
 });
 
-function makeFullAggregationEnvironment({ missingDomainSheet = '' } = {}) {
+function makeFullAggregationEnvironment({ missingDomainSheet = '', extraFiles = [] } = {}) {
   const events = [];
   const initialGas = loadGas();
   const sheets = [];
@@ -418,7 +418,10 @@ function makeFullAggregationEnvironment({ missingDomainSheet = '' } = {}) {
   const spreadsheet = new StatefulSpreadsheet(sheets, { events });
   if (missingDomainSheet) spreadsheet.sheets.delete(missingDomainSheet);
   const platform = makeStatefulGasPlatform(spreadsheet, { events });
-  const gas = loadGas({ platformOverrides: platform.platformOverrides });
+  const gas = loadGas({
+    platformOverrides: platform.platformOverrides,
+    files: extraFiles.length > 0 ? [...CORE_FILES, ...extraFiles] : undefined,
+  });
   return { events, spreadsheet, gas };
 }
 
@@ -438,6 +441,78 @@ test('定期集計統合: 18組すべてを同じ厳格経路で再計算しジ�
   assert.equal(jobs.valueAt(3, statusCol), 'SUCCEEDED');
   assert.equal(events.filter((event) => event === 'lock-acquired').length, 20);
   assert.equal(events.filter((event) => event === 'lock-released').length, 20);
+});
+
+// ------------------------------------------------------------
+// 全18枚集計テスト.gs（GASエディタから手で動かす確認用スクリプト）
+// ------------------------------------------------------------
+
+function makeManualRunnerEnvironment(options = {}) {
+  return makeFullAggregationEnvironment({ ...options, extraFiles: MANUAL_RUNNER_FILES });
+}
+
+test('18枚点検: 書き込まずに18組すべてを点検して通る枚数を返す', () => {
+  const { events, gas } = makeManualRunnerEnvironment();
+
+  const report = gas.test18_check();
+
+  assert.equal(report.total, 18);
+  assert.equal(report.ok, 18);
+  assert.equal(report.ng, 0);
+  assert.equal(report.lines.length, 18);
+  assert.equal(report.lines.every((line) => line.startsWith('✔')), true);
+  assert.equal(
+    events.some((event) => event.startsWith('write:')), false,
+    '点検はシートへ一切書き込まない',
+  );
+});
+
+test('18枚点検: 集計シートが無い組は✖として数え、他の組は点検を続ける', () => {
+  const { events, gas } = makeManualRunnerEnvironment({
+    missingDomainSheet: '【一般住宅】名古屋',
+  });
+
+  const report = gas.test18_check();
+
+  assert.equal(report.ok, 17);
+  assert.equal(report.ng, 1);
+  const failure = report.lines.find((line) => line.startsWith('✖'));
+  assert.match(failure, /【一般住宅】名古屋/);
+  assert.match(failure, /シートが見つかりません/);
+  assert.equal(events.some((event) => event.startsWith('write:')), false);
+});
+
+test('18枚再計算: 本番経路を通して18枚を書き込みサマリーを返す', () => {
+  const { spreadsheet, gas } = makeManualRunnerEnvironment();
+
+  const summary = gas.test18_run();
+
+  assert.equal(summary.success, true);
+  assert.equal(summary.total, 18);
+  assert.equal(summary.succeeded, 18);
+  assert.equal(summary.results.every((r) => r.verifiedCells === r.cells), true);
+
+  const jobs = spreadsheet.getSheetByName('_SYNC_JOBS');
+  const statusCol = gas.SYNC_LEDGER_HEADERS.indexOf('status') + 1;
+  assert.equal(jobs.valueAt(jobs.getLastRow(), statusCol), 'SUCCEEDED');
+});
+
+test('18枚再計算: 1組失敗しても残りは書き込み、レポート後に例外を再送出する', () => {
+  const { gas } = makeManualRunnerEnvironment({
+    missingDomainSheet: '【一般住宅】名古屋',
+  });
+
+  let thrown;
+  try {
+    gas.test18_run();
+  } catch (error) {
+    thrown = error;
+  }
+
+  assert.ok(thrown, '失敗を握りつぶさず再送出する');
+  assert.equal(thrown.name, 'DomainAggregationBatchError');
+  assert.equal(thrown.aggregationSummary.succeeded, 17);
+  assert.equal(thrown.aggregationSummary.failed, 1);
 });
 
 test('定期集計統合: 1組失敗時は成功扱いにせず対象・段階をジョブログへ残す', () => {
