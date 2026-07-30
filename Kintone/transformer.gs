@@ -7,8 +7,11 @@
 // ============================================================
 
 /**
- * "YYYY-MM-DD" 形式の問い合わせ日を、スプレッドシート管理用の年・月・日付に変換する
- * 21日以降は翌月扱い、12月21日以降は翌年扱い
+ * "YYYY-MM-DD" 形式の問い合わせ日を、スプレッドシート管理用の年度・月・日付に変換する
+ * 21日以降は翌月扱い、年度の切れ目（YEAR_ROLLOVER = 既定 9/21）以降は翌年度扱い
+ *
+ * 返す year は暦年ではなく**年度**。9/21以降の反響は翌年度になるため、
+ * 例えば 2026-10-05 は { year: '2027年', month: '10月' } になる。
  *
  * @param {string} inquiryDateStr - "YYYY-MM-DD" 形式の問い合わせ日
  * @returns {{ year: string, month: string, monthAndDay: string }|{}} 変換結果。入力が空の場合は空オブジェクト
@@ -21,8 +24,10 @@ function transformInquiryDate(inquiryDateStr) {
   let year  = origYear;
   let month = origMonth;
 
-  // 12月21日以降 → 翌年扱い
-  if (origMonth === YEAR_ROLLOVER.month && origDay >= YEAR_ROLLOVER.day) year++;
+  // 年度の切れ目以降 → 翌年度扱い（切れ目の月そのものだけでなく、それ以降の月も）
+  const afterRolloverMonth = origMonth > YEAR_ROLLOVER.month;
+  const onRolloverMonth = origMonth === YEAR_ROLLOVER.month && origDay >= YEAR_ROLLOVER.day;
+  if (afterRolloverMonth || onRolloverMonth) year++;
 
   // 21日以降 → 翌月扱い（12月→1月）
   if (origDay >= MONTH_ROLLOVER_DAY) {

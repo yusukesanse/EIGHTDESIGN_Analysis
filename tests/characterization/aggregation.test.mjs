@@ -195,7 +195,11 @@ function findWrite(writes, row, col) {
 // 住宅系
 // ------------------------------------------------------------
 
-test('住宅系: 年別ファネルは全管理年度の列を一覧から再計算する', () => {
+// 旧挙動: 集計シートの年ヘッダーにある全年度を毎回再計算していた。
+// 新挙動（2026-07-30）: 対象年度（今年度）の1列だけを再計算し、過年度の列は
+// 現在の値のまま凍結する。過年度のヘッダー欠落やデータ不備で今年度の同期を
+// 止めないため。過年度を計算し直したいときは B1 の対象年度を変える。
+test('住宅系: 年別ファネルは対象年度の列だけを再計算し過年度列には触れない', () => {
   const grid = makeResidentialGrid();
   const listData = [
     makeListRow({ year: '2026年', mtg1: '1月10日', mtg2: '2月1日', rank: 'A', likehood: '成約' }),
@@ -212,17 +216,13 @@ test('住宅系: 年別ファネルは全管理年度の列を一覧から再計
     [3, 2, 1, 0, 1, 2 / 3, 1 / 2, 0, 1 / 2, 1],
     '反響3/来場2/再来1/3回目0/成約1と各率'
   );
-  // 2025年列（B列）も現在値への差分加算ではなく、2025年一覧行だけから再計算する
-  const previousYear = findWrite(writes, 35, 2);
-  assert.ok(previousYear, '過年度列も再計算対象になる');
-  assert.deepStrictEqual(
-    previousYear.values.map((r) => r[0]),
-    [1, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-    '2025年は反響1/来場1として全面再計算'
+  assert.strictEqual(
+    findWrite(writes, 35, 2), undefined,
+    '過年度（2025年=B列）への書き込み指示は作らない'
   );
 });
 
-test('住宅系: 年度移動後は旧年度を0、新年度を1へ再計算する', () => {
+test('住宅系: 対象年度の集計は現在値を参照せず一覧から全面再計算する', () => {
   const grid = makeResidentialGrid();
   // 旧集計値が残っている状態を再現。書き込み計画は現在値を参照せず一覧から作る。
   setCell(grid, 35, 2, 99);
@@ -232,22 +232,78 @@ test('住宅系: 年度移動後は旧年度を0、新年度を1へ再計算す�
   ];
 
   const writes = g.buildAggregationWrites(grid, listData, '2026年', 'residential');
-  const oldYear = findWrite(writes, 35, 2);
-  const newYear = findWrite(writes, 35, 3);
 
-  assert.equal(oldYear.values[0][0], 0, '旧年度の反響数を0へ戻す');
-  assert.equal(newYear.values[0][0], 1, '新年度の反響数を1へ更新する');
+  assert.equal(findWrite(writes, 35, 3).values[0][0], 1, '対象年度の反響数を1へ更新する');
+  assert.strictEqual(findWrite(writes, 35, 2), undefined, '過年度の99はそのまま残す');
 });
 
-test('住宅系: 一覧年度に対応する必須年ヘッダーが無ければ失敗する', () => {
+// 年度が切り替わると対象年度の列がまだ無い。18枚を手で直すのは現実的でないので、
+// 年ラベルが連続している範囲の右隣へ列を作ってから集計する（2026-07-30 決定）。
+test('住宅系: 対象年度の列が無ければ年ラベルの右隣に作ってから集計する', () => {
+  const grid = makeResidentialGrid();  // 年ヘッダーは B=2025年 / C=2026年 のみ
+  const writes = g.buildAggregationWrites(
+    grid, [makeListRow({ year: '2027年', month: '10月' })], '2027年', 'residential',
+  );
+
+  const header = findWrite(writes, 34, 4);  // D34 に年ラベルを作る
+  assert.ok(header, '年ヘッダーセルの書き込み指示がある');
+  assert.deepStrictEqual(header.values, [['2027年']]);
+
+  assert.equal(findWrite(writes, 35, 4).values[0][0], 1, '新設列に反響数を書く');
+  assert.equal(findWrite(writes, 70, 4).values[9][0], 1, '新設列の10月に1件');
+  assert.ok(findWrite(writes, 229, 4), '媒体ブロックにも新設列を作る');
+  assert.ok(findWrite(writes, 471, 4), 'エリア（成約）にも新設列を作る');
+  assert.strictEqual(findWrite(writes, 35, 3), undefined, '既存の2026年列には触れない');
+});
+
+test('住宅系: 年ラベルの右隣が埋まっていれば列を作らずに失敗する', () => {
   const grid = makeResidentialGrid();
-  const listData = [
-    makeListRow({ year: '2027年', name: '未定義年度の顧客' }),
-  ];
+  setCell(grid, 34, 4, '備考');  // 年列の右隣が別用途で埋まっている
 
   assert.throws(
-    () => g.buildAggregationWrites(grid, listData, '2026年', 'residential'),
-    /必須年別ヘッダーが不足/
+    () => g.buildAggregationWrites(grid, [makeListRow({ year: '2027年' })], '2027年', 'residential'),
+    /2027年の列を作れません: D34 に「備考」があります/
+  );
+});
+
+test('住宅系: 別表の年ラベルは年列の範囲に含めない', () => {
+  const grid = makeResidentialGrid();
+  setCell(grid, 34, 20, '2023年');  // 離れた位置にある別表の年ラベル
+  const writes = g.buildAggregationWrites(
+    grid, [makeListRow({ year: '2027年' })], '2027年', 'residential',
+  );
+
+  assert.ok(findWrite(writes, 34, 4), '連続範囲の右隣（D34）に作る');
+  assert.strictEqual(findWrite(writes, 34, 21), undefined, '別表の右隣（U34）には作らない');
+});
+
+// 過年度のヘッダーが欠けていても今年度の同期は止めない（旧挙動では止まっていた）。
+// ヘッダー行の右側に別表の年ラベルが同居しているシートがあり、対象年度以外の
+// 重複・欠落まで見ると18組の大半が止まってしまうため。
+test('住宅系: 一覧に集計シート側の列が無い過年度があっても今年度は集計できる', () => {
+  const grid = makeResidentialGrid();
+  const listData = [
+    makeListRow({ year: '2017年', name: '大昔の顧客' }),   // 集計シートに列が無い年度
+    makeListRow({ year: '2026年', name: '今年度の顧客' }),
+  ];
+
+  const writes = g.buildAggregationWrites(grid, listData, '2026年', 'residential');
+  assert.equal(findWrite(writes, 35, 3).values[0][0], 1, '今年度の1件だけを数える');
+});
+
+test('住宅系: 対象年度の年ヘッダーが重複していれば失敗する（他年度の重複は無視）', () => {
+  const duplicated = makeResidentialGrid();
+  setCell(duplicated, 34, 20, '2026年');  // 対象年度が2箇所
+  assert.throws(
+    () => g.buildAggregationWrites(duplicated, [makeListRow()], '2026年', 'residential'),
+    /年別ヘッダーが重複/
+  );
+
+  const otherYearDuplicated = makeResidentialGrid();
+  setCell(otherYearDuplicated, 34, 20, '2025年');  // 別表の年ラベルが同居している状態
+  assert.ok(
+    g.buildAggregationWrites(otherYearDuplicated, [makeListRow()], '2026年', 'residential').length > 0,
+    '対象年度以外の重複では止まらない'
   );
 });
 
@@ -279,6 +335,90 @@ test('住宅系: 不正な月は月別合計から黙って落とさず書込前
     ),
     /月が不正/
   );
+});
+
+// 一覧のA列・B列には表示形式 `0"年"` / `0"月"` が設定されており、数値 2 を
+// 入れても画面上は「2月」に見える。getValues() は生値を返すため、
+// 見た目どおりに解釈しないと「シートは正しいのに集計だけ落ちる」状態になる。
+// 2026-07-30: 名古屋-一般住宅 B867 が数値 2 でWebhookが常時失敗していた。
+test('住宅系: 表示形式で「N月」に見える数値セルは N月 として月別反響数に数える', () => {
+  const grid = makeResidentialGrid();
+  const listData = [
+    makeListRow({ month: 2 }),
+    makeListRow({ month: '2月' }),
+  ];
+  const writes = g.buildAggregationWrites(grid, listData, '2026年', 'residential');
+  const monthly = findWrite(writes, 70, 3);
+  assert.ok(monthly);
+  const col = monthly.values.map((r) => r[0]);
+  assert.strictEqual(col[1], 2);   // 2月
+  assert.strictEqual(col[12], 2);  // 計
+});
+
+test('住宅系: 表示形式で「YYYY年」に見える数値セルは YYYY年 として扱う', () => {
+  const grid = makeResidentialGrid();
+  const listData = [
+    makeListRow({ year: 2026, month: '3月', name: '数値年度の顧客' }),
+    makeListRow({ year: 2025, month: '3月', name: '過年度の顧客' }),
+  ];
+  const writes = g.buildAggregationWrites(grid, listData, '2026年', 'residential');
+
+  const monthly = findWrite(writes, 70, 3);
+  assert.ok(monthly);
+  assert.strictEqual(monthly.values[2][0], 1, '数値2026を2026年として3月に数える');
+  assert.strictEqual(monthly.values[12][0], 1, '数値2025の行は対象外');
+});
+
+test('住宅系: 月の範囲外の数値は表示形式によらず失敗する', () => {
+  const grid = makeResidentialGrid();
+  for (const month of [0, 13, 2.5]) {
+    assert.throws(
+      () => g.buildAggregationWrites(
+        grid, [makeListRow({ month })], '2026年', 'residential',
+      ),
+      /月が不正/,
+      `month=${month}`
+    );
+  }
+});
+
+test('住宅系: 今年度の集計できない行は1件目で止めず全件をシート名・セル番地付きで報告する', () => {
+  const grid = makeResidentialGrid();
+  const listData = [
+    makeListRow({ name: '正常 太郎' }),
+    makeListRow({ month: '', name: '月なし 花子' }),
+    makeListRow({ month: '13月', name: '月おかしい 三郎' }),
+  ];
+
+  assert.throws(
+    () => g.buildAggregationWrites(
+      grid, listData, '2026年', 'residential', '名古屋-一般住宅',
+    ),
+    (err) => {
+      assert.match(err.message, /名古屋-一般住宅/);
+      assert.match(err.message, /2026年/);
+      assert.match(err.message, /2件/);
+      assert.match(err.message, /B2の月が不正です: \(空\)（月なし 花子）/);
+      assert.match(err.message, /B3の月が不正です: 13月（月おかしい 三郎）/);
+      return true;
+    }
+  );
+});
+
+// 年度セルが読めない行は今年度かどうか判別できない。過去データの掃除を待たずに
+// 同期を通すため、集計は止めず対象外にして呼び出し側の警告ログへ回す。
+test('住宅系: 年度が読めない行は集計を止めず対象外にして報告する', () => {
+  const grid = makeResidentialGrid();
+  const listData = [
+    makeListRow({ name: '今年度 太郎' }),
+    makeListRow({ year: '', month: '', name: '年月なし 次郎' }),
+    makeListRow({ year: '2018年', month: '', name: '過年度で月なし 花子' }),
+  ];
+
+  const writes = g.buildAggregationWrites(
+    grid, listData, '2026年', 'residential', '名古屋-一般住宅',
+  );
+  assert.equal(findWrite(writes, 35, 3).values[0][0], 1, '今年度の1件だけ数える');
 });
 
 // 旧挙動: 未定義ランクは書込前に失敗させていた。
@@ -528,9 +668,14 @@ test('resolveAggregationYear: B1が「20XX年」ならそれを使う', () => {
   assert.strictEqual(g.resolveAggregationYear(grid), '2027年');
 });
 
-test('resolveAggregationYear: B1が無ければ現在日付から算出（12/21以降は翌年）', () => {
+// エイトデザインの年度は9/20締め（config.gs の YEAR_ROLLOVER）。
+// 9/20までが今年度、9/21以降は翌年度。
+test('resolveAggregationYear: B1が無ければ現在日付から今年度を算出（9/21以降は翌年度）', () => {
   const grid = makeGrid(5, 5);
-  assert.strictEqual(g.resolveAggregationYear(grid, new Date('2026-07-24T00:00:00+09:00')), '2026年');
-  assert.strictEqual(g.resolveAggregationYear(grid, new Date('2026-12-21T00:00:00+09:00')), '2027年');
-  assert.strictEqual(g.resolveAggregationYear(grid, new Date('2026-12-20T00:00:00+09:00')), '2026年');
+  const at = (iso) => g.resolveAggregationYear(grid, new Date(iso + 'T00:00:00+09:00'));
+  assert.strictEqual(at('2026-07-24'), '2026年');
+  assert.strictEqual(at('2026-09-20'), '2026年', '9/20までは今年度');
+  assert.strictEqual(at('2026-09-21'), '2027年', '9/21以降は翌年度');
+  assert.strictEqual(at('2026-12-20'), '2027年', '年度の切れ目より後の月も翌年度');
+  assert.strictEqual(at('2027-03-01'), '2027年');
 });

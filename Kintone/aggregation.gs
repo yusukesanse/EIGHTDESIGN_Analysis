@@ -209,6 +209,12 @@ const AGG_CONSIDERATION_UNKNOWN_INDEX = 4;
 /** 対象年度セルの書式（例: 2026年） */
 const AGG_YEAR_PATTERN = /^20\d{2}年$/;
 
+/** 一覧シート反響月セルの書式（例: 2月） */
+const AGG_MONTH_PATTERN = /^(?:[1-9]|1[0-2])月$/;
+
+/** 集計不能行をまとめて報告するときの列挙上限 */
+const AGG_INVALID_ROW_SAMPLE_LIMIT = 20;
+
 /**
  * 年度列を持つ必須ブロック。
  * 各ブロックに存在する全年度を再計算し、一覧に存在する年度と B1 選択年度は
@@ -522,14 +528,17 @@ function dryRunDomainAggregationForSheet(domainType, area) {
  * @returns {{ sheet: string, targetYear: string, blocks: number, cells: number, diffs: number, samples: string[] }|null}
  */
 function _dryRunOneSheet(ss, domain, area, maxSamples) {
-  const listSheet   = ss.getSheetByName(buildListSheetName(area, domain.type));
+  const listSheetName = buildListSheetName(area, domain.type);
+  const listSheet   = ss.getSheetByName(listSheetName);
   const domainSheet = ss.getSheetByName(buildDomainSheetName(domain.type, area));
   if (!listSheet || !domainSheet) return null;
 
   const grid       = domainSheet.getDataRange().getValues();
   const listData   = listSheet.getDataRange().getValues();
   const targetYear = resolveAggregationYear(grid);
-  const writes     = buildAggregationWrites(grid, listData, targetYear, domain.style);
+  const writes     = buildAggregationWrites(
+    grid, listData, targetYear, domain.style, listSheetName
+  );
   const diff       = _diffAggregationWrites(grid, writes, maxSamples);
 
   return {
@@ -749,13 +758,33 @@ function _aggregateOneSheet(ss, domain, area) {
     const grid = domainSheet.getDataRange().getValues();
     const targetYear = resolveAggregationYear(grid);
 
+    // B1 の対象年度は人が選べる。今年度から取り残されると、今年度の反響が
+    // どの列にも入らないまま成功し続けるため、ズレを気付けるよう警告に残す。
+    const currentYear = computeCurrentAggregationYear();
+    if (targetYear !== currentYear) {
+      AppLogger.warn(
+        `_aggregateOneSheet: 対象年度が今年度と異なります（B1優先）: ${domainSheetName} ` +
+        `対象年度=${targetYear} / 今年度=${currentYear}`
+      );
+    }
+
     stage = 'PREFLIGHT';
-    const preflight = _validateAggregationPreflight(grid, listData, targetYear, domain.style);
+    const preflight = _validateAggregationPreflight(
+      grid, listData, targetYear, domain.style, listSheetName
+    );
     stage = 'BUILD_WRITES';
     const plan = _buildAggregationPlan(grid, listData, targetYear, domain.style, preflight);
     const writeStats = _validateAggregationWrites(plan.writes);
 
     stage = 'WRITE_VALUES';
+    // 新しい年度列がシートの右端を越える場合だけ列を足す（既存列には触れない）
+    _ensureSheetWidthForWrites(domainSheet, plan.writes);
+    if (plan.newYearColumns.length > 0) {
+      AppLogger.info(
+        `_aggregateOneSheet: ${targetYear}の年度列を新設します: ${domainSheetName} ` +
+        plan.newYearColumns.join(' / ')
+      );
+    }
     _applyAggregationWrites(domainSheet, plan.writes);
     if (typeof SpreadsheetApp !== 'undefined' && typeof SpreadsheetApp.flush === 'function') {
       SpreadsheetApp.flush();
@@ -771,6 +800,17 @@ function _aggregateOneSheet(ss, domain, area) {
       );
     }
 
+    // 年度セルが読めず今年度か判別できなかった行は、黙って落とさず警告に残す。
+    if (plan.unreadableRows && plan.unreadableRows.length > 0) {
+      AppLogger.warn(
+        `_aggregateOneSheet: 年度が読めない行を集計対象外にしました: ${listSheetName} ` +
+        plan.unreadableRows
+          .slice(0, AGG_INVALID_ROW_SAMPLE_LIMIT)
+          .map((r) => `${r.cell}=${r.shown}（${r.customerName}）`)
+          .join(' / ')
+      );
+    }
+
     const result = {
       status: 'SUCCESS',
       success: true,
@@ -781,6 +821,9 @@ function _aggregateOneSheet(ss, domain, area) {
       targetYear,
       managedYears: plan.managedYears,
       sourceRows: plan.sourceRows,
+      skippedOtherYears: plan.skippedOtherYears,
+      unreadableRows: (plan.unreadableRows || []).length,
+      newYearColumns: plan.newYearColumns,
       blocks: plan.writes.length,
       cells: writeStats.cells,
       verifiedCells: verification.cells,
@@ -796,6 +839,28 @@ function _aggregateOneSheet(ss, domain, area) {
       domainType: domain.type,
       area,
       durationMs: Date.now() - startedAtMs,
+    });
+  }
+}
+
+/**
+ * 書き込み指示が右端を越える場合に限り、シートへ列を足す。
+ * 年度が切り替わって新しい年度列を作るときだけ効く。既存の列構成は変えない。
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @param {Array<{ row: number, col: number, values: Array<Array<*>> }>} writes
+ */
+function _ensureSheetWidthForWrites(sheet, writes) {
+  if (typeof sheet.getMaxColumns !== 'function') return;
+  let requiredColumns = 0;
+  for (const w of writes) {
+    requiredColumns = Math.max(requiredColumns, w.col + w.values[0].length - 1);
+  }
+  const maxColumns = sheet.getMaxColumns();
+  if (requiredColumns > maxColumns) {
+    sheet.insertColumnsAfter(maxColumns, requiredColumns - maxColumns);
+    AppLogger.info('集計シートへ列を追加', {
+      sheet: sheet.getName(),
+      added: requiredColumns - maxColumns,
     });
   }
 }
@@ -853,10 +918,11 @@ function computeCurrentAggregationYear(now) {
  * @param {Array<Array<*>>} listData 一覧シートの全データ（0始まり、ヘッダー行含む）
  * @param {string} targetYear 詳細ブロックの対象年度（例: '2026年'）
  * @param {string} style 'residential' | 'business'
+ * @param {string} [listSheetName] エラーメッセージ用の一覧シート名
  * @returns {Array<{ row: number, col: number, values: Array<Array<*>> }>}
  */
-function buildAggregationWrites(grid, listData, targetYear, style) {
-  const preflight = _validateAggregationPreflight(grid, listData, targetYear, style);
+function buildAggregationWrites(grid, listData, targetYear, style, listSheetName) {
+  const preflight = _validateAggregationPreflight(grid, listData, targetYear, style, listSheetName);
   const plan = _buildAggregationPlan(grid, listData, targetYear, style, preflight);
   _validateAggregationWrites(plan.writes);
   return plan.writes;
@@ -905,48 +971,61 @@ function _buildAggregationPlan(grid, listData, targetYear, style, preflight) {
     return yearSets.get(year);
   };
 
-  // ── 年別列を持つ共通ブロック（各ブロックの全管理年度）──────
-  for (const { year } of context.yearSections.funnel.columns) {
-    pushRequired(_buildFunnelWrite(grid, getYearSet(year).all, year), `年別ファネル/${year}`);
-  }
-  for (const { year } of context.yearSections.monthly.columns) {
-    pushRequired(_buildMonthlyWrite(grid, getYearSet(year).all, year), `月別反響数/${year}`);
-  }
-  for (const { year } of context.yearSections.mediaAll.columns) {
-    pushRequired(
-      _buildLabeledYearColumnWrite(
-        grid, getYearSet(year).all, year, AGG_ROWS.MEDIA_ALL_HEADER, _mediaKeyResolver
-      ),
-      `反響媒体（全体）/${year}`
-    );
-  }
-  for (const { year } of context.yearSections.mediaClosed.columns) {
-    pushRequired(
-      _buildLabeledYearColumnWrite(
-        grid, getYearSet(year).closed, year, AGG_ROWS.MEDIA_CLOSED_HEADER, _mediaKeyResolver
-      ),
-      `反響媒体（成約）/${year}`
-    );
-  }
-  for (const { year } of context.yearSections.areaAll.columns) {
-    pushRequired(
-      _buildLabeledYearColumnWrite(
-        grid, getYearSet(year).all, year, AGG_ROWS.AREA_ALL_HEADER, _areaKeyResolver
-      ),
-      `エリア（全体）/${year}`
-    );
-  }
-  for (const { year } of context.yearSections.areaClosed.columns) {
-    pushRequired(
-      _buildLabeledYearColumnWrite(
-        grid, getYearSet(year).closed, year, AGG_ROWS.AREA_CLOSED_HEADER, _areaKeyResolver
-      ),
-      `エリア（成約）/${year}`
-    );
+  // ── 年別列を持つ共通ブロック（対象年度の1列だけ）────────────
+  // 過年度の列は現在の値のまま残す。今年度のデータだけを再計算する方針
+  // （2026-07-30 決定）。過年度を計算し直したいときは B1 の対象年度を変える。
+  const selected = getYearSet(targetYear);
+  const sections = context.yearSections;
+
+  // 年度が切り替わって列がまだ無いブロックは、年ヘッダーセルも同じ書き込み計画で作る。
+  for (const key of ['funnel', 'monthly', 'mediaAll', 'mediaClosed', 'areaAll', 'areaClosed']) {
+    const section = sections[key];
+    if (!section.isNewColumn) continue;
+    writes.push({
+      row: section.headerRow,
+      col: section.targetColIndex + 1,
+      values: [[targetYear]],
+    });
   }
 
-  // ── B1選択年度を使う共通・詳細ブロック ───────────────────
-  const selected = getYearSet(targetYear);
+  pushRequired(
+    _buildFunnelWrite(grid, selected.all, targetYear, sections.funnel.targetColIndex),
+    `年別ファネル/${targetYear}`
+  );
+  pushRequired(
+    _buildMonthlyWrite(grid, selected.all, targetYear, sections.monthly.targetColIndex),
+    `月別反響数/${targetYear}`
+  );
+  pushRequired(
+    _buildLabeledYearColumnWrite(
+      grid, selected.all, targetYear, AGG_ROWS.MEDIA_ALL_HEADER, _mediaKeyResolver,
+      sections.mediaAll.targetColIndex
+    ),
+    `反響媒体（全体）/${targetYear}`
+  );
+  pushRequired(
+    _buildLabeledYearColumnWrite(
+      grid, selected.closed, targetYear, AGG_ROWS.MEDIA_CLOSED_HEADER, _mediaKeyResolver,
+      sections.mediaClosed.targetColIndex
+    ),
+    `反響媒体（成約）/${targetYear}`
+  );
+  pushRequired(
+    _buildLabeledYearColumnWrite(
+      grid, selected.all, targetYear, AGG_ROWS.AREA_ALL_HEADER, _areaKeyResolver,
+      sections.areaAll.targetColIndex
+    ),
+    `エリア（全体）/${targetYear}`
+  );
+  pushRequired(
+    _buildLabeledYearColumnWrite(
+      grid, selected.closed, targetYear, AGG_ROWS.AREA_CLOSED_HEADER, _areaKeyResolver,
+      sections.areaClosed.targetColIndex
+    ),
+    `エリア（成約）/${targetYear}`
+  );
+
+  // ── 詳細ブロック（対象年度のみ・年別列を持たない）─────────
   pushRequired(_buildStaffWrites(grid, selected.all), '担当者別');
 
   // ── レイアウト別ブロック ──────────────────────────────────
@@ -986,21 +1065,90 @@ function _buildAggregationPlan(grid, listData, targetYear, style, preflight) {
     targetYear,
     managedYears: context.managedYears,
     sourceRows: context.sourceRows,
+    skippedOtherYears: context.skippedOtherYears,
+    unreadableRows: context.unreadableRows,
+    newYearColumns: context.newYearColumns,
   };
 }
 
 /**
- * 一覧行を年度別へ分割し、年度不正・年度欠落を明示エラーにする。
- * 先頭行がヘッダーと判定できる場合だけ年度形式チェックから除外する。
- * @param {Array<Array<*>>} listData
- * @returns {{ rowsByYear: Map<string, Array<Array<*>>>, years: string[], sourceRows: number }}
+ * 一覧の年度セル（A列）を集計で扱う "YYYY年" 表記へ正規化する。
+ *
+ * A列には表示形式 `0"年"` が設定されており、数値 2024 を入れても画面上は
+ * 「2024年」と表示される。getValues() は生値（数値）を返すため文字列比較では
+ * 弾かれるが、シート上の見た目と入力者の意図はどちらも「2024年」なので、
+ * 妥当な西暦の範囲に収まる整数だけ文字列表記へ寄せる。
+ * 文字列の "2024"（表示も "2024"）は見た目から年度と判別できないため寄せない。
+ *
+ * @param {*} value
+ * @returns {string}
  */
-function _partitionAggregationRowsByYear(listData) {
+function _normalizeAggregationYearCell(value) {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 2000 && value <= 2099) {
+    return `${value}年`;
+  }
+  return _cellText(value);
+}
+
+/**
+ * 一覧の反響月セル（B列）を集計で扱う "N月" 表記へ正規化する。
+ * 理由は _normalizeAggregationYearCell と同じ（B列の表示形式は `0"月"`）。
+ * @param {*} value
+ * @returns {string}
+ */
+function _normalizeAggregationMonthCell(value) {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 12) {
+    return `${value}月`;
+  }
+  return _cellText(value);
+}
+
+/**
+ * 集計不能セルをログ・エラー用に短く表す（空欄と型の違いを潰さない）
+ * @param {*} value
+ * @returns {string}
+ */
+function _describeInvalidListCell(value) {
+  const text = _cellText(value);
+  if (text === '') return '(空)';
+  if (typeof value === 'string') return text;
+  return `${text}（型: ${value instanceof Date ? 'Date' : typeof value}）`;
+}
+
+/**
+ * 一覧から対象年度（今年度）の行だけを取り出す。
+ *
+ * 方針（2026-07-30 決定）: 集計は今年度だけを対象にする。過年度の行は読み飛ばし、
+ * 過年度側のデータ不備で今年度の同期を止めない。ただし年度セルが読めない行は
+ * 今年度かどうか判別できないため、握りつぶさず unreadableRows として返して
+ * 呼び出し側で警告ログに残す。
+ *
+ * 対象年度の行の不備は従来どおり書き込み前に失敗させる。最初の1件で止めず
+ * 全件を集めてから1つのエラーにし、シート名とセル番地で修正先を特定できるようにする。
+ *
+ * 先頭行がヘッダーと判定できる場合だけ年度形式チェックから除外する。
+ *
+ * @param {Array<Array<*>>} listData
+ * @param {string} targetYear 対象年度（例: '2026年'）
+ * @param {string} [listSheetName] エラーメッセージ用の一覧シート名
+ * @returns {{
+ *   rowsByYear: Map<string, Array<Array<*>>>, years: string[], sourceRows: number,
+ *   skippedOtherYears: number,
+ *   unreadableRows: Array<{ cell: string, shown: string, customerName: string }>
+ * }}
+ */
+function _partitionAggregationRowsByYear(listData, targetYear, listSheetName) {
   if (!Array.isArray(listData)) {
     throw new Error('一覧シートデータが配列ではありません');
   }
+  if (!AGG_YEAR_PATTERN.test(_cellText(targetYear))) {
+    throw new Error(`一覧の絞り込みに使う対象年度が不正です: ${targetYear || '(空)'}`);
+  }
 
   const rowsByYear = new Map();
+  const invalidRows = [];
+  const unreadableRows = [];
+  let skippedOtherYears = 0;
   let sourceRows = 0;
   for (let rowIndex = 0; rowIndex < listData.length; rowIndex++) {
     const row = listData[rowIndex];
@@ -1008,7 +1156,10 @@ function _partitionAggregationRowsByYear(listData) {
       throw new Error(`一覧シート${rowIndex + 1}行目が配列ではありません`);
     }
 
-    const year = _cellText(row[SALES_LIST_COLS.YEAR - 1]);
+    const rowNumber = rowIndex + 1;
+    const yearCell = row[SALES_LIST_COLS.YEAR - 1];
+    const monthCell = row[SALES_LIST_COLS.MONTH - 1];
+    const year = _normalizeAggregationYearCell(yearCell);
     const customerName = _cellText(row[SALES_LIST_COLS.CUSTOMER_NAME - 1]);
     const isHeader = rowIndex === 0 && !AGG_YEAR_PATTERN.test(year) && (
       /年|年度/.test(year) || /顧客|お客様/.test(customerName)
@@ -1019,36 +1170,90 @@ function _partitionAggregationRowsByYear(listData) {
     // 顧客データとして扱い、レイアウト行の文字や数式を年度不正と誤判定しない。
     if (customerName === '') continue;
     if (!AGG_YEAR_PATTERN.test(year)) {
-      throw new Error(
-        `一覧シート${rowIndex + 1}行目の年度が不正です: ${year || '(空)'}`
-      );
+      unreadableRows.push({
+        cell: _toA1(rowNumber, SALES_LIST_COLS.YEAR),
+        shown: _describeInvalidListCell(yearCell),
+        customerName,
+      });
+      continue;
     }
-    const month = _cellText(row[SALES_LIST_COLS.MONTH - 1]);
-    if (!/^(?:[1-9]|1[0-2])月$/.test(month)) {
-      throw new Error(
-        `一覧シート${rowIndex + 1}行目の月が不正です: ${month || '(空)'}`
-      );
+    if (year !== targetYear) {
+      skippedOtherYears++;
+      continue;
     }
 
+    const month = _normalizeAggregationMonthCell(monthCell);
+    if (!AGG_MONTH_PATTERN.test(month)) {
+      invalidRows.push({
+        cell: _toA1(rowNumber, SALES_LIST_COLS.MONTH),
+        label: '月',
+        shown: _describeInvalidListCell(monthCell),
+        customerName,
+      });
+      continue;
+    }
+
+    // 正規化した年度・月で行を差し替える。月別反響数など後続の集計は行から
+    // 直接 A/B 列を読み直すため、ここで揃えておかないと数え落としになる。
+    const normalizedRow = row.slice();
+    normalizedRow[SALES_LIST_COLS.YEAR - 1] = year;
+    normalizedRow[SALES_LIST_COLS.MONTH - 1] = month;
+
     if (!rowsByYear.has(year)) rowsByYear.set(year, []);
-    rowsByYear.get(year).push(row);
+    rowsByYear.get(year).push(normalizedRow);
     sourceRows++;
   }
 
+  if (invalidRows.length > 0) {
+    throw new Error(_buildInvalidListRowsMessage(invalidRows, listSheetName, targetYear));
+  }
+
   const years = [...rowsByYear.keys()].sort(_compareAggregationYears);
-  return { rowsByYear, years, sourceRows };
+  return { rowsByYear, years, sourceRows, skippedOtherYears, unreadableRows };
 }
 
 /**
- * 年ヘッダー行から管理年度と列位置を取得する。
+ * 集計不能行のエラーメッセージを組み立てる
+ * @param {Array<{ cell: string, label: string, shown: string, customerName: string }>} invalidRows
+ * @param {string} [listSheetName]
+ * @param {string} [targetYear]
+ * @returns {string}
+ */
+function _buildInvalidListRowsMessage(invalidRows, listSheetName, targetYear) {
+  const sheetLabel = listSheetName ? `一覧シート「${listSheetName}」` : '一覧シート';
+  const yearLabel = targetYear ? `${targetYear}に` : '';
+  const details = invalidRows
+    .slice(0, AGG_INVALID_ROW_SAMPLE_LIMIT)
+    .map((r) => `${r.cell}の${r.label}が不正です: ${r.shown}（${r.customerName}）`)
+    .join(' / ');
+  const omitted = invalidRows.length - Math.min(invalidRows.length, AGG_INVALID_ROW_SAMPLE_LIMIT);
+  return (
+    `${sheetLabel}${yearLabel}集計できない行が${invalidRows.length}件あります: ` +
+    details + (omitted > 0 ? ` ほか${omitted}件` : '')
+  );
+}
+
+/**
+ * 年ヘッダー行から対象年度の列位置を取得する。無ければ作る位置を決める。
+ *
+ * 書き込むのは対象年度の1列だけなので、必須なのも重複が致命的なのも対象年度だけ。
+ * ヘッダー行の右側に別表の年ラベルが同居しているシートがあるため、対象年度以外の
+ * 年ラベルは列一覧に集めるだけで、欠落・重複を理由に集計を止めない。
+ *
+ * 年度が切り替わって対象年度の列がまだ無い場合は、**年ラベルが連続している範囲の
+ * 右隣**へ新しい年度列を作る（2026-07-30 決定）。列を作らないと年度切替の日に
+ * 18枚すべてが一斉に止まるため。別表の年ラベルを巻き込まないよう、連続範囲の
+ * 外にある年ラベルは基準にしない。書き込み先が空でなければ作らずに失敗させる。
+ *
  * @param {Array<Array<*>>} grid
  * @param {{ key: string, label: string, headerRow: number }} section
+ * @param {string} targetYear
  * @returns {{
- *   key: string, label: string, headerRow: number,
- *   columns: Array<{ year: string, colIndex: number }>
+ *   key: string, label: string, headerRow: number, targetColIndex: number,
+ *   isNewColumn: boolean, columns: Array<{ year: string, colIndex: number }>
  * }}
  */
-function _readAggregationYearSection(grid, section) {
+function _readAggregationYearSection(grid, section, targetYear) {
   const row = grid[section.headerRow - 1];
   if (!Array.isArray(row)) {
     throw new Error(
@@ -1057,25 +1262,52 @@ function _readAggregationYearSection(grid, section) {
   }
 
   const columns = [];
-  const seen = new Set();
+  let targetColIndex = -1;
+  let runStart = -1;
+  let runEnd = -1;
   for (let colIndex = 1; colIndex < row.length; colIndex++) {
     const year = _cellText(row[colIndex]);
     if (!AGG_YEAR_PATTERN.test(year)) continue;
-    if (seen.has(year)) {
-      throw new Error(
-        `年別ヘッダーが重複しています: ${section.label}/${year}`
-      );
+    if (year === targetYear) {
+      if (targetColIndex !== -1) {
+        throw new Error(
+          `年別ヘッダーが重複しています: ${section.label}/${year}` +
+          `（${_toA1(section.headerRow, targetColIndex + 1)} と ` +
+          `${_toA1(section.headerRow, colIndex + 1)}）`
+        );
+      }
+      targetColIndex = colIndex;
     }
-    seen.add(year);
+    // 年ラベルが連続している先頭の範囲だけをこのブロックの年列とみなす。
+    // 間が空いたら別表の年ラベルなので、範囲は広げない。
+    if (runStart === -1) {
+      runStart = colIndex;
+      runEnd = colIndex;
+    } else if (colIndex === runEnd + 1) {
+      runEnd = colIndex;
+    }
     columns.push({ year, colIndex });
   }
 
-  if (columns.length === 0) {
+  if (targetColIndex !== -1) {
+    return { ...section, columns, targetColIndex, isNewColumn: false };
+  }
+
+  if (runEnd === -1) {
     throw new Error(
       `必須年別ヘッダーが見つかりません: ${section.label}（${section.headerRow}行）`
     );
   }
-  return { ...section, columns };
+
+  const newColIndex = runEnd + 1;
+  const occupant = _cellText(row[newColIndex]);
+  if (occupant !== '') {
+    throw new Error(
+      `${section.label}に${targetYear}の列を作れません: ` +
+      `${_toA1(section.headerRow, newColIndex + 1)} に「${occupant}」があります`
+    );
+  }
+  return { ...section, columns, targetColIndex: newColIndex, isNewColumn: true };
 }
 
 /**
@@ -1161,20 +1393,27 @@ function _validateRequiredAggregationSections(grid, style) {
 
 /**
  * 書き込み前に、年度・必須セクション・一覧行を一括検証する。
+ *
+ * 検証するのも書き込むのも対象年度（今年度）の1年分だけ。過年度の列は
+ * 現在の値のまま凍結し、過年度側のヘッダー欠落・データ不備で今年度の同期を止めない。
+ *
  * @param {Array<Array<*>>} grid
  * @param {Array<Array<*>>} listData
  * @param {string} targetYear
  * @param {string} style
+ * @param {string} [listSheetName]
  * @returns {{
  *   rowsByYear: Map<string, Array<Array<*>>>, listYears: string[],
  *   managedYears: string[], sourceRows: number,
+ *   skippedOtherYears: number,
+ *   unreadableRows: Array<{ cell: string, shown: string, customerName: string }>,
  *   yearSections: Object<string, {
- *     key: string, label: string, headerRow: number,
+ *     key: string, label: string, headerRow: number, targetColIndex: number,
  *     columns: Array<{ year: string, colIndex: number }>
  *   }>
  * }}
  */
-function _validateAggregationPreflight(grid, listData, targetYear, style) {
+function _validateAggregationPreflight(grid, listData, targetYear, style, listSheetName) {
   if (!Array.isArray(grid) || grid.length === 0) {
     throw new Error('集計シートデータが空です');
   }
@@ -1185,24 +1424,11 @@ function _validateAggregationPreflight(grid, listData, targetYear, style) {
     throw new Error(`未対応の集計レイアウトです: ${style}`);
   }
 
-  const partitioned = _partitionAggregationRowsByYear(listData);
-  const requiredYears = [...new Set([...partitioned.years, targetYear])]
-    .sort(_compareAggregationYears);
+  const partitioned = _partitionAggregationRowsByYear(listData, targetYear, listSheetName);
   const yearSections = {};
-  const managedYearSet = new Set();
 
   for (const definition of AGG_YEARLY_SECTIONS) {
-    const section = _readAggregationYearSection(grid, definition);
-    const availableYears = new Set(section.columns.map((column) => column.year));
-    const missingYears = requiredYears.filter((year) => !availableYears.has(year));
-    if (missingYears.length > 0) {
-      throw new Error(
-        `必須年別ヘッダーが不足しています: ${section.label}` +
-        `（${section.headerRow}行）不足=${missingYears.join(', ')}`
-      );
-    }
-    for (const { year } of section.columns) managedYearSet.add(year);
-    yearSections[section.key] = section;
+    yearSections[definition.key] = _readAggregationYearSection(grid, definition, targetYear);
   }
 
   _validateRequiredAggregationSections(grid, style);
@@ -1211,8 +1437,13 @@ function _validateAggregationPreflight(grid, listData, targetYear, style) {
   return {
     rowsByYear: partitioned.rowsByYear,
     listYears: partitioned.years,
-    managedYears: [...managedYearSet].sort(_compareAggregationYears),
+    managedYears: [targetYear],
     sourceRows: partitioned.sourceRows,
+    skippedOtherYears: partitioned.skippedOtherYears,
+    unreadableRows: partitioned.unreadableRows,
+    newYearColumns: Object.values(yearSections)
+      .filter((section) => section.isNewColumn)
+      .map((section) => `${section.label}=${_toA1(section.headerRow, section.targetColIndex + 1)}`),
     yearSections,
   };
 }
@@ -1486,10 +1717,11 @@ function _countFunnel(yearData) {
  * @param {Array<Array<*>>} grid
  * @param {Array<Array<*>>} yearData
  * @param {string} targetYear
+ * @param {number} [resolvedColIndex] preflightで決めた対象年度列（新設列を含む）
  * @returns {{ row: number, col: number, values: Array<Array<*>> }|null}
  */
-function _buildFunnelWrite(grid, yearData, targetYear) {
-  const colIndex = _findYearColumn(grid, AGG_ROWS.FUNNEL_HEADER, targetYear);
+function _buildFunnelWrite(grid, yearData, targetYear, resolvedColIndex) {
+  const colIndex = resolvedColIndex ?? _findYearColumn(grid, AGG_ROWS.FUNNEL_HEADER, targetYear);
   if (colIndex === -1) {
     throw new Error(`年別ファネルの対象年度列が見つかりません: ${targetYear}`);
   }
@@ -1514,10 +1746,11 @@ function _buildFunnelWrite(grid, yearData, targetYear) {
  * @param {Array<Array<*>>} grid
  * @param {Array<Array<*>>} yearData
  * @param {string} targetYear
+ * @param {number} [resolvedColIndex] preflightで決めた対象年度列（新設列を含む）
  * @returns {{ row: number, col: number, values: Array<Array<*>> }|null}
  */
-function _buildMonthlyWrite(grid, yearData, targetYear) {
-  const colIndex = _findYearColumn(grid, AGG_ROWS.MONTHLY_HEADER, targetYear);
+function _buildMonthlyWrite(grid, yearData, targetYear, resolvedColIndex) {
+  const colIndex = resolvedColIndex ?? _findYearColumn(grid, AGG_ROWS.MONTHLY_HEADER, targetYear);
   if (colIndex === -1) {
     throw new Error(`月別反響数の対象年度列が見つかりません: ${targetYear}`);
   }
@@ -1677,10 +1910,11 @@ function _areaKeyResolver(row, labels) {
  * @param {string} targetYear
  * @param {number} headerRow 年ヘッダー行（1始まり）
  * @param {function(Array<*>, string[]): number} keyResolver 行 → ラベルインデックス
+ * @param {number} [resolvedColIndex] preflightで決めた対象年度列（新設列を含む）
  * @returns {{ row: number, col: number, values: Array<Array<*>> }|null}
  */
-function _buildLabeledYearColumnWrite(grid, dataSet, targetYear, headerRow, keyResolver) {
-  const colIndex = _findYearColumn(grid, headerRow, targetYear);
+function _buildLabeledYearColumnWrite(grid, dataSet, targetYear, headerRow, keyResolver, resolvedColIndex) {
+  const colIndex = resolvedColIndex ?? _findYearColumn(grid, headerRow, targetYear);
   if (colIndex === -1) {
     throw new Error(
       `ラベル別集計の対象年度列が見つかりません: ${headerRow}行/${targetYear}`

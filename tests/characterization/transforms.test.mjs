@@ -14,11 +14,24 @@ test('日付変換: 21日は翌月扱い', () => {
   assert.deepEqual(g.transformInquiryDate('2025-03-21'),
     { year: '2025年', month: '4月', monthAndDay: '3月21日' });
 });
-test('日付変換: 12月20日は当年12月のまま', () => {
-  assert.deepEqual(g.transformInquiryDate('2025-12-20'),
-    { year: '2025年', month: '12月', monthAndDay: '12月20日' });
+// 旧挙動: 年の繰り上がりは12/21だった（暦年に近い扱い）。
+// 新挙動（2026-07-30）: エイトデザインの年度は9/20締め。9/20までが今年度、
+// 9/21以降は翌年度。切れ目は config.gs の YEAR_ROLLOVER で変更できる。
+test('日付変換: 9月20日は今年度のまま', () => {
+  assert.deepEqual(g.transformInquiryDate('2025-09-20'),
+    { year: '2025年', month: '9月', monthAndDay: '9月20日' });
 });
-test('日付変換: 12月21日は翌年1月へ繰り上がる', () => {
+test('日付変換: 9月21日は翌年度10月へ繰り上がる', () => {
+  assert.deepEqual(g.transformInquiryDate('2025-09-21'),
+    { year: '2026年', month: '10月', monthAndDay: '9月21日' });
+});
+test('日付変換: 年度の切れ目より後の月も翌年度になる', () => {
+  assert.deepEqual(g.transformInquiryDate('2025-10-05'),
+    { year: '2026年', month: '10月', monthAndDay: '10月5日' });
+  assert.deepEqual(g.transformInquiryDate('2025-12-20'),
+    { year: '2026年', month: '12月', monthAndDay: '12月20日' });
+});
+test('日付変換: 12月21日は翌月繰り上がりで翌暦年1月（年度は変わらず）', () => {
   assert.deepEqual(g.transformInquiryDate('2025-12-21'),
     { year: '2026年', month: '1月', monthAndDay: '12月21日' });
 });
